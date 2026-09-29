@@ -15,6 +15,7 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/joho/godotenv v1.5.1 // indirect
+	github.com/lib/pq v1.12.3 // indirect
 	github.com/panjf2000/ants/v2 v2.12.1 // indirect
 	github.com/panjf2000/gnet/v2 v2.10.0 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
