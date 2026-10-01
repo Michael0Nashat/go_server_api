@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,7 +18,7 @@ import (
 	"github.com/nelthaarion/breeze"
 	middleware "github.com/nelthaarion/breeze/middlewares"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 var db *sql.DB
@@ -133,6 +134,40 @@ func main() {
 	)
 
 	// =========================
+	// Patients API
+	// =========================
+
+	router.HandleBlocking(
+		breeze.POST,
+		"/patients",
+		CreatePatient,
+	)
+
+	router.HandleBlocking(
+		breeze.GET,
+		"/patients",
+		GetPatients,
+	)
+
+	router.HandleBlocking(
+		breeze.GET,
+		"/patients/:id",
+		GetPatient,
+	)
+
+	router.HandleBlocking(
+		breeze.PUT,
+		"/patients/:id",
+		UpdatePatient,
+	)
+
+	router.HandleBlocking(
+		breeze.DELETE,
+		"/patients/:id",
+		DeletePatient,
+	)
+
+	// =========================
 	// Worker Pool
 	// =========================
 
@@ -191,7 +226,8 @@ func InitDB() error {
 
 func CreateTables() error {
 
-	query := `
+	queries := []string{
+		`
 	CREATE TABLE IF NOT EXISTS doctors (
 		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -255,11 +291,24 @@ func CreateTables() error {
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
-	`
+	`,
+		`
+	CREATE TABLE IF NOT EXISTS patients (
+		id BIGSERIAL PRIMARY KEY,
+		username VARCHAR(100) NOT NULL UNIQUE,
+		phone VARCHAR(20) NOT NULL UNIQUE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	`,
+	}
 
-	_, err := db.Exec(query)
+	for _, query := range queries {
+		if _, err := db.Exec(query); err != nil {
+			return err
+		}
+	}
 
-	return err
+	return nil
 }
 
 // ============================================================
@@ -905,6 +954,406 @@ func DeleteDoctor(ctx *breeze.Context) {
 }
 
 // ============================================================
+// Patient Request
+// ============================================================
+
+// Patient mirrors a row of the patients table. The id is a BIGSERIAL, so it
+// travels as a JSON number and is read from the URL with strconv.ParseInt.
+type Patient struct {
+	ID        int64  `json:"id"`
+	Username  string `json:"username"`
+	Phone     string `json:"phone"`
+	CreatedAt string `json:"created_at"`
+}
+
+// CreatePatientRequest is the JSON body accepted by POST /patients.
+type CreatePatientRequest struct {
+	Username string `json:"username"`
+	Phone    string `json:"phone"`
+}
+
+// UpdatePatientRequest is the JSON body accepted by PUT /patients/:id. Both
+// fields are required, mirroring how UpdateDoctor replaces the whole record.
+type UpdatePatientRequest struct {
+	Username string `json:"username"`
+	Phone    string `json:"phone"`
+}
+
+// ============================================================
+// Create Patient
+// ============================================================
+
+func CreatePatient(ctx *breeze.Context) {
+
+	var payload CreatePatientRequest
+
+	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{
+			"error": "Invalid JSON body",
+		})
+		return
+	}
+
+	username := strings.TrimSpace(payload.Username)
+	phone := strings.TrimSpace(payload.Phone)
+
+	// =========================
+	// Required fields
+	// =========================
+
+	required := map[string]string{
+		"username": username,
+		"phone":    phone,
+	}
+
+	for field, value := range required {
+		if value == "" {
+			ctx.Status(400)
+			ctx.JSON(map[string]interface{}{
+				"error": field + " is required",
+			})
+			return
+		}
+	}
+
+	// =========================
+	// Insert
+	// =========================
+
+	query := `
+		INSERT INTO patients (
+			username,
+			phone
+		)
+		VALUES ($1, $2)
+		RETURNING id, created_at
+	`
+
+	var id int64
+	var createdAt time.Time
+
+	err := db.QueryRow(
+		query,
+		username,
+		phone,
+	).Scan(
+		&id,
+		&createdAt,
+	)
+
+	if err != nil {
+		if isUniqueViolation(err) {
+			ctx.Status(409)
+			ctx.JSON(map[string]interface{}{
+				"error": "Username or phone already exists",
+			})
+			return
+		}
+
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error":   "Failed to create patient",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	ctx.Status(201)
+	ctx.JSON(map[string]interface{}{
+		"message": "Patient created successfully",
+		"patient": Patient{
+			ID:        id,
+			Username:  username,
+			Phone:     phone,
+			CreatedAt: createdAt.Format(time.RFC3339),
+		},
+	})
+}
+
+// ============================================================
+// Get Patients
+// ============================================================
+
+func GetPatients(ctx *breeze.Context) {
+
+	rows, err := db.Query(`
+		SELECT
+			id,
+			username,
+			phone,
+			created_at
+		FROM patients
+		ORDER BY created_at DESC
+	`)
+
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	defer rows.Close()
+
+	patients := []Patient{}
+
+	for rows.Next() {
+
+		var p Patient
+		var createdAt time.Time
+
+		err := rows.Scan(
+			&p.ID,
+			&p.Username,
+			&p.Phone,
+			&createdAt,
+		)
+
+		if err != nil {
+			ctx.Status(500)
+			ctx.JSON(map[string]interface{}{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		p.CreatedAt = createdAt.Format(time.RFC3339)
+
+		patients = append(patients, p)
+	}
+
+	if err := rows.Err(); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	ctx.JSON(map[string]interface{}{
+		"count":    len(patients),
+		"patients": patients,
+	})
+}
+
+// ============================================================
+// Get Patient
+// ============================================================
+
+func GetPatient(ctx *breeze.Context) {
+
+	id, err := strconv.ParseInt(ctx.Param("id"), 10, 64)
+	if err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{
+			"error": "Invalid patient id",
+		})
+		return
+	}
+
+	var p Patient
+	var createdAt time.Time
+
+	err = db.QueryRow(`
+		SELECT
+			id,
+			username,
+			phone,
+			created_at
+		FROM patients
+		WHERE id = $1
+	`, id).Scan(
+		&p.ID,
+		&p.Username,
+		&p.Phone,
+		&createdAt,
+	)
+
+	if err == sql.ErrNoRows {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{
+			"error": "Patient not found",
+		})
+		return
+	}
+
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	p.CreatedAt = createdAt.Format(time.RFC3339)
+
+	ctx.JSON(map[string]interface{}{
+		"patient": p,
+	})
+}
+
+// ============================================================
+// Update Patient
+// ============================================================
+
+func UpdatePatient(ctx *breeze.Context) {
+
+	id, err := strconv.ParseInt(ctx.Param("id"), 10, 64)
+	if err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{
+			"error": "Invalid patient id",
+		})
+		return
+	}
+
+	var payload UpdatePatientRequest
+
+	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{
+			"error": "Invalid JSON body",
+		})
+		return
+	}
+
+	username := strings.TrimSpace(payload.Username)
+	phone := strings.TrimSpace(payload.Phone)
+
+	// =========================
+	// Required fields
+	// =========================
+
+	required := map[string]string{
+		"username": username,
+		"phone":    phone,
+	}
+
+	for field, value := range required {
+		if value == "" {
+			ctx.Status(400)
+			ctx.JSON(map[string]interface{}{
+				"error": field + " is required",
+			})
+			return
+		}
+	}
+
+	// =========================
+	// Update
+	// =========================
+
+	result, err := db.Exec(`
+		UPDATE patients
+		SET
+			username = $1,
+			phone = $2
+		WHERE id = $3
+	`,
+		username,
+		phone,
+		id,
+	)
+
+	if err != nil {
+		if isUniqueViolation(err) {
+			ctx.Status(409)
+			ctx.JSON(map[string]interface{}{
+				"error": "Username or phone already exists",
+			})
+			return
+		}
+
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error":   "Failed to update patient",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	rows, err := result.RowsAffected()
+
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	if rows == 0 {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{
+			"error": "Patient not found",
+		})
+		return
+	}
+
+	ctx.JSON(map[string]interface{}{
+		"message": "Patient updated successfully",
+		"patient": Patient{
+			ID:       id,
+			Username: username,
+			Phone:    phone,
+		},
+	})
+}
+
+// ============================================================
+// Delete Patient
+// ============================================================
+
+func DeletePatient(ctx *breeze.Context) {
+
+	id, err := strconv.ParseInt(ctx.Param("id"), 10, 64)
+	if err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{
+			"error": "Invalid patient id",
+		})
+		return
+	}
+
+	result, err := db.Exec(
+		"DELETE FROM patients WHERE id = $1",
+		id,
+	)
+
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	rows, err := result.RowsAffected()
+
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	if rows == 0 {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{
+			"error": "Patient not found",
+		})
+		return
+	}
+
+	ctx.JSON(map[string]interface{}{
+		"message": "Patient deleted successfully",
+	})
+}
+
+// ============================================================
 // File Upload Helper
 // ============================================================
 
@@ -956,6 +1405,19 @@ func readUploadedFile(
 
 func httpDetectContentType(data []byte) string {
 	return http.DetectContentType(data)
+}
+
+// ============================================================
+// Database Error Helper
+// ============================================================
+
+// isUniqueViolation reports whether err is a Postgres 23505 (unique_violation),
+// which the patients table raises when a username or phone is already taken.
+// Both columns are UNIQUE, so the create and update paths need to tell that
+// case apart from a genuine failure to return 409 instead of 500.
+func isUniqueViolation(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23505"
 }
 
 // ============================================================
