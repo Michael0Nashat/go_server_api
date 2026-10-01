@@ -125,6 +125,13 @@ func main() {
 		DeleteDoctor,
 	)
 
+	// Static segment, so it wins over "/doctors/:id" for POST lookups.
+	router.HandleBlocking(
+		breeze.POST,
+		"/doctors/login",
+		LoginDoctor,
+	)
+
 	// =========================
 	// Worker Pool
 	// =========================
@@ -656,6 +663,129 @@ func GetDoctor(ctx *breeze.Context) {
 
 	ctx.JSON(map[string]interface{}{
 		"doctor": d,
+	})
+}
+
+// ============================================================
+// Login Request
+// ============================================================
+
+// LoginDoctor authenticates a doctor from the two fields the login form sends.
+// Both are matched case-insensitively and whitespace-trimmed, because the
+// values are typed by hand and Arabic names are often entered inconsistently.
+type LoginRequest struct {
+	FullName string `json:"full_name"`
+	Email    string `json:"email"`
+}
+
+// ============================================================
+// Login Doctor
+// ============================================================
+
+func LoginDoctor(ctx *breeze.Context) {
+
+	var payload LoginRequest
+
+	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{
+			"error": "Invalid JSON body",
+		})
+		return
+	}
+
+	fullName := strings.TrimSpace(payload.FullName)
+	email := strings.ToLower(strings.TrimSpace(payload.Email))
+
+	// =========================
+	// Required fields
+	// =========================
+
+	if fullName == "" {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{
+			"error": "full_name is required",
+		})
+		return
+	}
+
+	if email == "" {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{
+			"error": "email is required",
+		})
+		return
+	}
+
+	// =========================
+	// Lookup
+	// =========================
+
+	var d Doctor
+
+	var emailResult sql.NullString
+
+	var createdAt time.Time
+	var updatedAt time.Time
+
+	err := db.QueryRow(`
+		SELECT
+			id,
+			full_name,
+			phone,
+			email,
+			medical_syndicate_id,
+			birth_date,
+			specialty,
+			professional_degree,
+			governorate,
+			created_at,
+			updated_at
+		FROM doctors
+		WHERE LOWER(full_name) = LOWER($1)
+			AND LOWER(email) = LOWER($2)
+		LIMIT 1
+	`, fullName, email).Scan(
+		&d.ID,
+		&d.FullName,
+		&d.Phone,
+		&emailResult,
+		&d.MedicalSyndicateID,
+		&d.BirthDate,
+		&d.Specialty,
+		&d.ProfessionalDegree,
+		&d.Governorate,
+		&createdAt,
+		&updatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		ctx.Status(401)
+		ctx.JSON(map[string]interface{}{
+			"error": "Invalid credentials",
+		})
+		return
+	}
+
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error":   "Failed to log in",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	if emailResult.Valid {
+		d.Email = &emailResult.String
+	}
+
+	d.CreatedAt = createdAt.Format(time.RFC3339)
+	d.UpdatedAt = updatedAt.Format(time.RFC3339)
+
+	ctx.JSON(map[string]interface{}{
+		"message": "Login successful",
+		"doctor":  d,
 	})
 }
 
