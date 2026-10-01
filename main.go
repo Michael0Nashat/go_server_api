@@ -224,10 +224,11 @@ func InitDB() error {
 // Create Tables
 // ============================================================
 
-func CreateTables() error {
-
-	queries := []string{
-		`
+// doctorsDDL and patientsDDL are the schemas this service owns. Both are
+// idempotent, so CreateTables can run on every boot without touching rows that
+// already exist.
+var (
+	doctorsDDL = `
 	CREATE TABLE IF NOT EXISTS doctors (
 		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -291,16 +292,21 @@ func CreateTables() error {
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
-	`,
-		`
+	`
+
+	patientsDDL = `
 	CREATE TABLE IF NOT EXISTS patients (
 		id BIGSERIAL PRIMARY KEY,
 		username VARCHAR(100) NOT NULL UNIQUE,
 		phone VARCHAR(20) NOT NULL UNIQUE,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
-	`,
-	}
+	`
+)
+
+func CreateTables() error {
+
+	queries := []string{doctorsDDL, patientsDDL}
 
 	for _, query := range queries {
 		if _, err := db.Exec(query); err != nil {
