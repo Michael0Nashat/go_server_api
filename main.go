@@ -143,6 +143,12 @@ func main() {
 		LoginDoctor,
 	)
 
+	router.HandleBlocking(
+		breeze.PATCH,
+		"/doctors/:id/status",
+		UpdateDoctorStatus,
+	)
+
 	// =========================
 	// Patients API
 	// =========================
@@ -318,6 +324,8 @@ var (
 		national_id_card TEXT NOT NULL,
 		specialty_certificate TEXT,
 
+		is_online BOOLEAN NOT NULL DEFAULT FALSE,
+
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
@@ -360,11 +368,24 @@ var (
 	CREATE INDEX IF NOT EXISTS idx_messages_conversation_created
 	ON messages(conversation_id, created_at, id);
 	`
+
+	// Idempotent migration: adds is_online to existing doctors tables.
+	doctorsAddIsOnlineDDL = `
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'doctors' AND column_name = 'is_online'
+		) THEN
+			ALTER TABLE doctors ADD COLUMN is_online BOOLEAN NOT NULL DEFAULT FALSE;
+		END IF;
+	END$$;
+	`
 )
 
 func CreateTables() error {
 
-	queries := []string{doctorsDDL, patientsDDL, conversationsDDL, messagesDDL, messagesIndexDDL}
+	queries := []string{doctorsDDL, patientsDDL, conversationsDDL, messagesDDL, messagesIndexDDL, doctorsAddIsOnlineDDL}
 
 	for _, query := range queries {
 		if _, err := db.Exec(query); err != nil {
@@ -394,8 +415,18 @@ type Doctor struct {
 	MedicalSyndicateCard string  `json:"medical_syndicate_card"`
 	NationalIDCard       string  `json:"national_id_card"`
 	SpecialtyCertificate *string `json:"specialty_certificate,omitempty"`
+	IsOnline             bool    `json:"is_online"`
+	OnlineStatus         string  `json:"online_status"`
 	CreatedAt            string  `json:"created_at"`
 	UpdatedAt            string  `json:"updated_at"`
+}
+
+// doctorOnlineStatus returns the human-readable Arabic status label.
+func doctorOnlineStatus(isOnline bool) string {
+	if isOnline {
+		return "أنت أونلاين متصل\n🟢 متاح للاستشارة الفورية"
+	}
+	return "🔴 غير متاح حالياً"
 }
 
 // ============================================================
@@ -637,6 +668,7 @@ func GetDoctors(ctx *breeze.Context) {
 			specialty,
 			professional_degree,
 			governorate,
+			is_online,
 			created_at,
 			updated_at
 		FROM doctors
@@ -673,6 +705,7 @@ func GetDoctors(ctx *breeze.Context) {
 			&d.Specialty,
 			&d.ProfessionalDegree,
 			&d.Governorate,
+			&d.IsOnline,
 			&createdAt,
 			&updatedAt,
 		)
@@ -688,6 +721,7 @@ func GetDoctors(ctx *breeze.Context) {
 			d.Email = &email.String
 		}
 
+		d.OnlineStatus = doctorOnlineStatus(d.IsOnline)
 		d.CreatedAt = createdAt.Format(time.RFC3339)
 		d.UpdatedAt = updatedAt.Format(time.RFC3339)
 
@@ -730,6 +764,7 @@ func GetDoctor(ctx *breeze.Context) {
 			medical_syndicate_card,
 			national_id_card,
 			specialty_certificate,
+			is_online,
 			created_at,
 			updated_at
 		FROM doctors
@@ -749,6 +784,7 @@ func GetDoctor(ctx *breeze.Context) {
 		&d.MedicalSyndicateCard,
 		&d.NationalIDCard,
 		&d.SpecialtyCertificate,
+		&d.IsOnline,
 		&createdAt,
 		&updatedAt,
 	)
@@ -771,6 +807,7 @@ func GetDoctor(ctx *breeze.Context) {
 		d.Email = &email.String
 	}
 
+	d.OnlineStatus = doctorOnlineStatus(d.IsOnline)
 	d.CreatedAt = createdAt.Format(time.RFC3339)
 	d.UpdatedAt = updatedAt.Format(time.RFC3339)
 
@@ -852,6 +889,7 @@ func LoginDoctor(ctx *breeze.Context) {
 			specialty,
 			professional_degree,
 			governorate,
+			is_online,
 			created_at,
 			updated_at
 		FROM doctors
@@ -868,6 +906,7 @@ func LoginDoctor(ctx *breeze.Context) {
 		&d.Specialty,
 		&d.ProfessionalDegree,
 		&d.Governorate,
+		&d.IsOnline,
 		&createdAt,
 		&updatedAt,
 	)
@@ -893,6 +932,7 @@ func LoginDoctor(ctx *breeze.Context) {
 		d.Email = &emailResult.String
 	}
 
+	d.OnlineStatus = doctorOnlineStatus(d.IsOnline)
 	d.CreatedAt = createdAt.Format(time.RFC3339)
 	d.UpdatedAt = updatedAt.Format(time.RFC3339)
 
@@ -973,6 +1013,68 @@ func UpdateDoctor(ctx *breeze.Context) {
 
 	ctx.JSON(map[string]interface{}{
 		"message": "Doctor updated successfully",
+	})
+}
+
+// ============================================================
+// Update Doctor Status (Online / Offline)
+// ============================================================
+
+// UpdateDoctorStatusRequest is the JSON body for PATCH /doctors/:id/status.
+type UpdateDoctorStatusRequest struct {
+	IsOnline bool `json:"is_online"`
+}
+
+// UpdateDoctorStatus toggles the online availability flag for a doctor.
+// A doctor that sets is_online = true will appear as:
+//
+//	"أنت أونلاين متصل\n🟢 متاح للاستشارة الفورية"
+func UpdateDoctorStatus(ctx *breeze.Context) {
+
+	id := ctx.Param("id")
+
+	var payload UpdateDoctorStatusRequest
+
+	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{
+			"error": "Invalid JSON body",
+		})
+		return
+	}
+
+	result, err := db.Exec(`
+		UPDATE doctors
+		SET is_online = $1, updated_at = NOW()
+		WHERE id = $2
+	`, payload.IsOnline, id)
+
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error":   "Failed to update doctor status",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	if rows == 0 {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{"error": "Doctor not found"})
+		return
+	}
+
+	ctx.JSON(map[string]interface{}{
+		"message":       "Status updated successfully",
+		"is_online":     payload.IsOnline,
+		"online_status": doctorOnlineStatus(payload.IsOnline),
 	})
 }
 
