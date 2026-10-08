@@ -2513,10 +2513,12 @@ func loadSchedules(workPlaceID string) []WorkSchedule {
 		}
 		s.DayName = arabicDayName(s.DayOfWeek)
 		if from.Valid {
-			s.FromTime = &from.String
+			t := trimSeconds(from.String)
+			s.FromTime = &t
 		}
 		if to.Valid {
-			s.ToTime = &to.String
+			t := trimSeconds(to.String)
+			s.ToTime = &t
 		}
 		result = append(result, s)
 	}
@@ -2530,6 +2532,15 @@ func isValidTime(s string) bool {
 	}
 	_, err := time.Parse("15:04", s)
 	return err == nil
+}
+
+// trimSeconds truncates a time string returned by PostgreSQL ("HH:MM:SS" or
+// "HH:MM:SS.ffffff") down to "HH:MM" so it matches what the UI expects.
+func trimSeconds(s string) string {
+	if len(s) >= 5 {
+		return s[:5]
+	}
+	return s
 }
 
 // scanNullableString copies a scanned NullString into an optional pointer.
