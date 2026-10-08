@@ -184,6 +184,19 @@ func main() {
 	)
 
 	// =========================
+	// Work Places API
+	// =========================
+
+	router.HandleBlocking(breeze.POST, "/work-places", CreateWorkPlace)
+	router.HandleBlocking(breeze.GET, "/work-places", GetWorkPlaces)
+	router.HandleBlocking(breeze.GET, "/work-places/:id", GetWorkPlace)
+	router.HandleBlocking(breeze.PUT, "/work-places/:id", UpdateWorkPlace)
+	router.HandleBlocking(breeze.DELETE, "/work-places/:id", DeleteWorkPlace)
+
+	// Schedules nested under a work place
+	router.HandleBlocking(breeze.POST, "/work-places/:id/schedules", SetWorkSchedules)
+
+	// =========================
 	// Chat API
 	// =========================
 
@@ -381,11 +394,72 @@ var (
 		END IF;
 	END$$;
 	`
+
+	// work_places stores each clinic / hospital a doctor works at.
+	workPlacesDDL = `
+	CREATE TABLE IF NOT EXISTS work_places (
+		id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		doctor_id   UUID NOT NULL REFERENCES doctors(id) ON DELETE CASCADE,
+
+		place_type  VARCHAR(30) NOT NULL
+			CHECK (place_type IN ('عيادة خاصة', 'مستشفى', 'مركز طبي', 'مستوصف')),
+
+		name        VARCHAR(200) NOT NULL,
+		address     TEXT NOT NULL,
+		phone       VARCHAR(20),
+		exam_price  NUMERIC(10, 2),
+
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	`
+
+	// work_schedules stores weekly availability slots for a work place.
+	// Each row is one time slot for one day of the week.
+	// A day can have two rows (two periods) or zero rows (day off).
+	workSchedulesDDL = `
+	CREATE TABLE IF NOT EXISTS work_schedules (
+		id            BIGSERIAL PRIMARY KEY,
+		work_place_id UUID NOT NULL REFERENCES work_places(id) ON DELETE CASCADE,
+
+		day_of_week   SMALLINT NOT NULL
+			CHECK (day_of_week BETWEEN 0 AND 6),
+			-- 0 = السبت, 1 = الأحد, 2 = الاثنين, 3 = الثلاثاء,
+			-- 4 = الأربعاء, 5 = الخميس, 6 = الجمعة
+
+		is_off        BOOLEAN NOT NULL DEFAULT FALSE,
+
+		-- NULL when is_off = TRUE
+		from_time     TIME,
+		to_time       TIME,
+
+		CONSTRAINT work_schedules_times_check
+			CHECK (
+				is_off = TRUE
+				OR (from_time IS NOT NULL AND to_time IS NOT NULL AND from_time < to_time)
+			)
+	);
+	`
+
+	workSchedulesIndexDDL = `
+	CREATE INDEX IF NOT EXISTS idx_work_schedules_place_day
+	ON work_schedules(work_place_id, day_of_week);
+	`
 )
 
 func CreateTables() error {
 
-	queries := []string{doctorsDDL, patientsDDL, conversationsDDL, messagesDDL, messagesIndexDDL, doctorsAddIsOnlineDDL}
+	queries := []string{
+		doctorsDDL,
+		patientsDDL,
+		conversationsDDL,
+		messagesDDL,
+		messagesIndexDDL,
+		doctorsAddIsOnlineDDL,
+		workPlacesDDL,
+		workSchedulesDDL,
+		workSchedulesIndexDDL,
+	}
 
 	for _, query := range queries {
 		if _, err := db.Exec(query); err != nil {
@@ -419,6 +493,79 @@ type Doctor struct {
 	OnlineStatus         string  `json:"online_status"`
 	CreatedAt            string  `json:"created_at"`
 	UpdatedAt            string  `json:"updated_at"`
+}
+
+// ============================================================
+// Work Place & Schedule — Types
+// ============================================================
+
+// WorkPlace represents one clinic or hospital a doctor works at.
+type WorkPlace struct {
+	ID        string   `json:"id"`
+	DoctorID  string   `json:"doctor_id"`
+	PlaceType string   `json:"place_type"`
+	Name      string   `json:"name"`
+	Address   string   `json:"address"`
+	Phone     *string  `json:"phone,omitempty"`
+	ExamPrice *float64 `json:"exam_price,omitempty"`
+	Schedules []WorkSchedule `json:"schedules,omitempty"`
+	CreatedAt string   `json:"created_at"`
+	UpdatedAt string   `json:"updated_at"`
+}
+
+// WorkSchedule represents one time slot for a specific day of the week.
+// A day with is_off = true has no from/to times.
+// A day can have up to two rows (two periods) in the table.
+type WorkSchedule struct {
+	ID          int64   `json:"id"`
+	WorkPlaceID string  `json:"work_place_id"`
+	DayOfWeek   int     `json:"day_of_week"` // 0=السبت … 6=الجمعة
+	DayName     string  `json:"day_name"`
+	IsOff       bool    `json:"is_off"`
+	FromTime    *string `json:"from_time,omitempty"` // "HH:MM"
+	ToTime      *string `json:"to_time,omitempty"`   // "HH:MM"
+}
+
+// CreateWorkPlaceRequest is the JSON body for POST /work-places.
+// Schedules is optional; each item may carry 1 or 2 time slots per day.
+type CreateWorkPlaceRequest struct {
+	DoctorID  string                `json:"doctor_id"`
+	PlaceType string                `json:"place_type"`
+	Name      string                `json:"name"`
+	Address   string                `json:"address"`
+	Phone     string                `json:"phone"`
+	ExamPrice *float64              `json:"exam_price"`
+	Schedules []WorkScheduleInput   `json:"schedules"`
+}
+
+// UpdateWorkPlaceRequest is the JSON body for PUT /work-places/:id.
+type UpdateWorkPlaceRequest struct {
+	PlaceType string   `json:"place_type"`
+	Name      string   `json:"name"`
+	Address   string   `json:"address"`
+	Phone     string   `json:"phone"`
+	ExamPrice *float64 `json:"exam_price"`
+}
+
+// WorkScheduleInput carries one time slot for a day.
+// Send is_off = true (and omit from/to) to mark the day as unavailable.
+type WorkScheduleInput struct {
+	DayOfWeek int    `json:"day_of_week"`
+	IsOff     bool   `json:"is_off"`
+	FromTime  string `json:"from_time"` // "HH:MM" or ""
+	ToTime    string `json:"to_time"`   // "HH:MM" or ""
+}
+
+// arabicDayName maps 0-indexed day (0=Saturday) to the Arabic label.
+func arabicDayName(d int) string {
+	names := []string{
+		"السبت", "الأحد", "الاثنين", "الثلاثاء",
+		"الأربعاء", "الخميس", "الجمعة",
+	}
+	if d >= 0 && d < len(names) {
+		return names[d]
+	}
+	return ""
 }
 
 // doctorOnlineStatus returns the human-readable Arabic status label.
@@ -1967,6 +2114,433 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 
 	default:
 		_ = conn.SendText(`{"type":"error","error":"Unknown event type"}`)
+	}
+}
+
+// ============================================================
+// Work Places — CRUD
+// ============================================================
+
+// CreateWorkPlace handles POST /work-places.
+// Body: CreateWorkPlaceRequest (JSON). Schedules are optional.
+func CreateWorkPlace(ctx *breeze.Context) {
+	var payload CreateWorkPlaceRequest
+	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{"error": "Invalid JSON body"})
+		return
+	}
+
+	payload.DoctorID = strings.TrimSpace(payload.DoctorID)
+	payload.PlaceType = strings.TrimSpace(payload.PlaceType)
+	payload.Name = strings.TrimSpace(payload.Name)
+	payload.Address = strings.TrimSpace(payload.Address)
+	payload.Phone = strings.TrimSpace(payload.Phone)
+
+	required := map[string]string{
+		"doctor_id":  payload.DoctorID,
+		"place_type": payload.PlaceType,
+		"name":       payload.Name,
+		"address":    payload.Address,
+	}
+	for field, val := range required {
+		if val == "" {
+			ctx.Status(400)
+			ctx.JSON(map[string]interface{}{"error": field + " is required"})
+			return
+		}
+	}
+
+	// Verify doctor exists
+	var doctorExists bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM doctors WHERE id = $1)`, payload.DoctorID,
+	).Scan(&doctorExists); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to validate doctor", "details": err.Error()})
+		return
+	}
+	if !doctorExists {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{"error": "Doctor not found"})
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to start transaction", "details": err.Error()})
+		return
+	}
+	defer tx.Rollback()
+
+	var wp WorkPlace
+	var nsPhone sql.NullString
+	var nfPrice sql.NullFloat64
+	var createdAt, updatedAt time.Time
+
+	err = tx.QueryRow(`
+		INSERT INTO work_places (doctor_id, place_type, name, address, phone, exam_price)
+		VALUES ($1, $2, $3, $4, NULLIF($5,''), $6)
+		RETURNING id, doctor_id, place_type, name, address, phone, exam_price, created_at, updated_at
+	`, payload.DoctorID, payload.PlaceType, payload.Name, payload.Address,
+		payload.Phone, payload.ExamPrice,
+	).Scan(
+		&wp.ID, &wp.DoctorID, &wp.PlaceType, &wp.Name, &wp.Address,
+		&nsPhone, &nfPrice,
+		&createdAt, &updatedAt,
+	)
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to create work place", "details": err.Error()})
+		return
+	}
+	scanNullableString(nsPhone, &wp.Phone)
+	scanNullableFloat(nfPrice, &wp.ExamPrice)
+	wp.CreatedAt = createdAt.Format(time.RFC3339)
+	wp.UpdatedAt = updatedAt.Format(time.RFC3339)
+
+	// Insert schedules if provided
+	if len(payload.Schedules) > 0 {
+		if err := insertSchedules(tx, wp.ID, payload.Schedules); err != nil {
+			ctx.Status(400)
+			ctx.JSON(map[string]interface{}{"error": err.Error()})
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to commit transaction", "details": err.Error()})
+		return
+	}
+
+	wp.Schedules = loadSchedules(wp.ID)
+
+	ctx.Status(201)
+	ctx.JSON(map[string]interface{}{"work_place": wp})
+}
+
+// GetWorkPlaces handles GET /work-places?doctor_id=...
+func GetWorkPlaces(ctx *breeze.Context) {
+	doctorID := strings.TrimSpace(ctx.Query("doctor_id"))
+
+	query := `
+		SELECT id, doctor_id, place_type, name, address, phone, exam_price, created_at, updated_at
+		FROM work_places
+	`
+	args := []interface{}{}
+	if doctorID != "" {
+		query += " WHERE doctor_id = $1"
+		args = append(args, doctorID)
+	}
+	query += " ORDER BY created_at ASC"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	places := []WorkPlace{}
+	for rows.Next() {
+		var wp WorkPlace
+		var nsP sql.NullString
+		var nfP sql.NullFloat64
+		var createdAt, updatedAt time.Time
+		if err := rows.Scan(
+			&wp.ID, &wp.DoctorID, &wp.PlaceType, &wp.Name, &wp.Address,
+			&nsP, &nfP,
+			&createdAt, &updatedAt,
+		); err != nil {
+			ctx.Status(500)
+			ctx.JSON(map[string]interface{}{"error": err.Error()})
+			return
+		}
+		scanNullableString(nsP, &wp.Phone)
+		scanNullableFloat(nfP, &wp.ExamPrice)
+		wp.CreatedAt = createdAt.Format(time.RFC3339)
+		wp.UpdatedAt = updatedAt.Format(time.RFC3339)
+		wp.Schedules = loadSchedules(wp.ID)
+		places = append(places, wp)
+	}
+
+	ctx.JSON(map[string]interface{}{"count": len(places), "work_places": places})
+}
+
+// GetWorkPlace handles GET /work-places/:id
+func GetWorkPlace(ctx *breeze.Context) {
+	id := ctx.Param("id")
+
+	var wp WorkPlace
+	var nsP sql.NullString
+	var nfP sql.NullFloat64
+	var createdAt, updatedAt time.Time
+
+	err := db.QueryRow(`
+		SELECT id, doctor_id, place_type, name, address, phone, exam_price, created_at, updated_at
+		FROM work_places
+		WHERE id = $1
+	`, id).Scan(
+		&wp.ID, &wp.DoctorID, &wp.PlaceType, &wp.Name, &wp.Address,
+		&nsP, &nfP,
+		&createdAt, &updatedAt,
+	)
+	if err == sql.ErrNoRows {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{"error": "Work place not found"})
+		return
+	}
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		return
+	}
+	scanNullableString(nsP, &wp.Phone)
+	scanNullableFloat(nfP, &wp.ExamPrice)
+	wp.CreatedAt = createdAt.Format(time.RFC3339)
+	wp.UpdatedAt = updatedAt.Format(time.RFC3339)
+	wp.Schedules = loadSchedules(wp.ID)
+
+	ctx.JSON(map[string]interface{}{"work_place": wp})
+}
+
+// UpdateWorkPlace handles PUT /work-places/:id
+func UpdateWorkPlace(ctx *breeze.Context) {
+	id := ctx.Param("id")
+
+	var payload UpdateWorkPlaceRequest
+	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{"error": "Invalid JSON body"})
+		return
+	}
+
+	payload.PlaceType = strings.TrimSpace(payload.PlaceType)
+	payload.Name = strings.TrimSpace(payload.Name)
+	payload.Address = strings.TrimSpace(payload.Address)
+	payload.Phone = strings.TrimSpace(payload.Phone)
+
+	required := map[string]string{
+		"place_type": payload.PlaceType,
+		"name":       payload.Name,
+		"address":    payload.Address,
+	}
+	for field, val := range required {
+		if val == "" {
+			ctx.Status(400)
+			ctx.JSON(map[string]interface{}{"error": field + " is required"})
+			return
+		}
+	}
+
+	result, err := db.Exec(`
+		UPDATE work_places
+		SET
+			place_type = $1,
+			name       = $2,
+			address    = $3,
+			phone      = NULLIF($4, ''),
+			exam_price = $5,
+			updated_at = NOW()
+		WHERE id = $6
+	`, payload.PlaceType, payload.Name, payload.Address, payload.Phone, payload.ExamPrice, id)
+
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to update work place", "details": err.Error()})
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{"error": "Work place not found"})
+		return
+	}
+
+	ctx.JSON(map[string]interface{}{"message": "Work place updated successfully"})
+}
+
+// DeleteWorkPlace handles DELETE /work-places/:id
+func DeleteWorkPlace(ctx *breeze.Context) {
+	id := ctx.Param("id")
+
+	result, err := db.Exec(`DELETE FROM work_places WHERE id = $1`, id)
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		return
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{"error": "Work place not found"})
+		return
+	}
+	ctx.JSON(map[string]interface{}{"message": "Work place deleted successfully"})
+}
+
+// ============================================================
+// Work Schedules
+// ============================================================
+
+// SetWorkSchedules handles POST /work-places/:id/schedules.
+// It replaces ALL schedules for the given work place with the new ones.
+// Body: { "schedules": [ WorkScheduleInput, ... ] }
+func SetWorkSchedules(ctx *breeze.Context) {
+	workPlaceID := ctx.Param("id")
+
+	var body struct {
+		Schedules []WorkScheduleInput `json:"schedules"`
+	}
+	if err := json.Unmarshal(ctx.Req.Body, &body); err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{"error": "Invalid JSON body"})
+		return
+	}
+
+	// Verify place exists
+	var exists bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM work_places WHERE id = $1)`, workPlaceID,
+	).Scan(&exists); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		return
+	}
+	if !exists {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{"error": "Work place not found"})
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to start transaction", "details": err.Error()})
+		return
+	}
+	defer tx.Rollback()
+
+	// Delete old schedules
+	if _, err := tx.Exec(`DELETE FROM work_schedules WHERE work_place_id = $1`, workPlaceID); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to clear schedules", "details": err.Error()})
+		return
+	}
+
+	if len(body.Schedules) > 0 {
+		if err := insertSchedules(tx, workPlaceID, body.Schedules); err != nil {
+			ctx.Status(400)
+			ctx.JSON(map[string]interface{}{"error": err.Error()})
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to commit transaction", "details": err.Error()})
+		return
+	}
+
+	ctx.JSON(map[string]interface{}{
+		"message":   "Schedules updated successfully",
+		"schedules": loadSchedules(workPlaceID),
+	})
+}
+
+// ============================================================
+// Work Schedules — Internal Helpers
+// ============================================================
+
+// insertSchedules inserts schedule rows inside an active transaction.
+// Each input with is_off = false must have valid from_time / to_time ("HH:MM").
+func insertSchedules(tx *sql.Tx, workPlaceID string, schedules []WorkScheduleInput) error {
+	for i, s := range schedules {
+		if s.DayOfWeek < 0 || s.DayOfWeek > 6 {
+			return fmt.Errorf("schedules[%d]: day_of_week must be 0–6", i)
+		}
+		if s.IsOff {
+			if _, err := tx.Exec(`
+				INSERT INTO work_schedules (work_place_id, day_of_week, is_off, from_time, to_time)
+				VALUES ($1, $2, TRUE, NULL, NULL)
+			`, workPlaceID, s.DayOfWeek); err != nil {
+				return fmt.Errorf("failed to insert schedule for day %d: %w", s.DayOfWeek, err)
+			}
+			continue
+		}
+		// Validate time strings
+		if !isValidTime(s.FromTime) || !isValidTime(s.ToTime) {
+			return fmt.Errorf("schedules[%d]: from_time and to_time must be HH:MM", i)
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO work_schedules (work_place_id, day_of_week, is_off, from_time, to_time)
+			VALUES ($1, $2, FALSE, $3, $4)
+		`, workPlaceID, s.DayOfWeek, s.FromTime, s.ToTime); err != nil {
+			return fmt.Errorf("failed to insert schedule for day %d: %w", s.DayOfWeek, err)
+		}
+	}
+	return nil
+}
+
+// loadSchedules fetches all schedule rows for a work place and groups
+// them as-is, preserving multiple periods per day.
+func loadSchedules(workPlaceID string) []WorkSchedule {
+	rows, err := db.Query(`
+		SELECT id, work_place_id, day_of_week, is_off, from_time, to_time
+		FROM work_schedules
+		WHERE work_place_id = $1
+		ORDER BY day_of_week ASC, id ASC
+	`, workPlaceID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var result []WorkSchedule
+	for rows.Next() {
+		var s WorkSchedule
+		var from, to sql.NullString
+		if err := rows.Scan(&s.ID, &s.WorkPlaceID, &s.DayOfWeek, &s.IsOff, &from, &to); err != nil {
+			continue
+		}
+		s.DayName = arabicDayName(s.DayOfWeek)
+		if from.Valid {
+			s.FromTime = &from.String
+		}
+		if to.Valid {
+			s.ToTime = &to.String
+		}
+		result = append(result, s)
+	}
+	return result
+}
+
+// isValidTime checks that s matches "HH:MM".
+func isValidTime(s string) bool {
+	if len(s) != 5 || s[2] != ':' {
+		return false
+	}
+	_, err := time.Parse("15:04", s)
+	return err == nil
+}
+
+// scanNullableString copies a scanned NullString into an optional pointer.
+func scanNullableString(ns sql.NullString, p **string) {
+	if ns.Valid {
+		s := ns.String
+		*p = &s
+	}
+}
+
+// scanNullableFloat copies a scanned NullFloat64 into an optional pointer.
+func scanNullableFloat(nf sql.NullFloat64, p **float64) {
+	if nf.Valid {
+		f := nf.Float64
+		*p = &f
 	}
 }
 
