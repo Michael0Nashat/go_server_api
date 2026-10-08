@@ -2476,6 +2476,10 @@ func insertSchedules(tx *sql.Tx, workPlaceID string, schedules []WorkScheduleInp
 		if !isValidTime(s.FromTime) || !isValidTime(s.ToTime) {
 			return fmt.Errorf("schedules[%d]: from_time and to_time must be HH:MM", i)
 		}
+		if s.FromTime >= s.ToTime {
+			return fmt.Errorf("schedules[%d] (day %d): from_time (%s) must be before to_time (%s)",
+				i, s.DayOfWeek, s.FromTime, s.ToTime)
+		}
 		if _, err := tx.Exec(`
 			INSERT INTO work_schedules (work_place_id, day_of_week, is_off, from_time, to_time)
 			VALUES ($1, $2, FALSE, $3, $4)
