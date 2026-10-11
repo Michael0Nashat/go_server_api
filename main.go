@@ -2494,12 +2494,15 @@ func insertSchedules(tx *sql.Tx, workPlaceID string, schedules []WorkScheduleInp
 // them as-is, preserving multiple periods per day.
 func loadSchedules(workPlaceID string) []WorkSchedule {
 	rows, err := db.Query(`
-		SELECT id, work_place_id, day_of_week, is_off, from_time, to_time
+		SELECT id, work_place_id, day_of_week, is_off,
+		       to_char(from_time, 'HH24:MI'),
+		       to_char(to_time,   'HH24:MI')
 		FROM work_schedules
 		WHERE work_place_id = $1
-		ORDER BY day_of_week ASC, id ASC
+		ORDER BY day_of_week ASC, from_time ASC NULLS LAST, id ASC
 	`, workPlaceID)
 	if err != nil {
+		log.Println("loadSchedules query error:", err)
 		return nil
 	}
 	defer rows.Close()
@@ -2509,15 +2512,16 @@ func loadSchedules(workPlaceID string) []WorkSchedule {
 		var s WorkSchedule
 		var from, to sql.NullString
 		if err := rows.Scan(&s.ID, &s.WorkPlaceID, &s.DayOfWeek, &s.IsOff, &from, &to); err != nil {
+			log.Println("loadSchedules scan error:", err)
 			continue
 		}
 		s.DayName = arabicDayName(s.DayOfWeek)
 		if from.Valid {
-			t := trimSeconds(from.String)
+			t := from.String
 			s.FromTime = &t
 		}
 		if to.Valid {
-			t := trimSeconds(to.String)
+			t := to.String
 			s.ToTime = &t
 		}
 		result = append(result, s)
