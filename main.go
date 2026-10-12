@@ -159,6 +159,13 @@ func main() {
 		CreatePatient,
 	)
 
+	// Static segment wins over "/patients/:id" for POST lookups.
+	router.HandleBlocking(
+		breeze.POST,
+		"/patients/login",
+		LoginPatient,
+	)
+
 	router.HandleBlocking(
 		breeze.GET,
 		"/patients",
@@ -1316,6 +1323,87 @@ type CreatePatientRequest struct {
 type UpdatePatientRequest struct {
 	Username string `json:"username"`
 	Phone    string `json:"phone"`
+}
+
+// ============================================================
+// Login Patient
+// ============================================================
+
+type LoginPatientRequest struct {
+	Username string `json:"username"`
+	Phone    string `json:"phone"`
+}
+
+func LoginPatient(ctx *breeze.Context) {
+
+	var payload LoginPatientRequest
+
+	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{
+			"error": "Invalid JSON body",
+		})
+		return
+	}
+
+	username := strings.TrimSpace(payload.Username)
+	phone := strings.TrimSpace(payload.Phone)
+
+	// =========================
+	// Required fields
+	// =========================
+
+	required := map[string]string{
+		"username": username,
+		"phone":    phone,
+	}
+
+	for field, value := range required {
+		if value == "" {
+			ctx.Status(400)
+			ctx.JSON(map[string]interface{}{
+				"error": field + " is required",
+			})
+			return
+		}
+	}
+
+	// =========================
+	// Lookup patient
+	// =========================
+
+	var p Patient
+	err := db.QueryRow(`
+		SELECT id, username, phone, created_at
+		FROM patients
+		WHERE username = $1 AND phone = $2
+	`, username, phone).Scan(
+		&p.ID,
+		&p.Username,
+		&p.Phone,
+		&p.CreatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		ctx.Status(401)
+		ctx.JSON(map[string]interface{}{
+			"error": "Invalid credentials",
+		})
+		return
+	}
+
+	if err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{
+			"error":   "Failed to log in",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	ctx.JSON(map[string]interface{}{
+		"patient": p,
+	})
 }
 
 // ============================================================
