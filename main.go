@@ -272,9 +272,13 @@ func InitDB() error {
 // Create Tables
 // ============================================================
 
-// doctorsDDL and patientsDDL are the schemas this service owns. Both are
-// idempotent, so CreateTables can run on every boot without touching rows that
-// already exist.
+// All DDL below is idempotent, so CreateTables can run on every boot without
+// touching rows that already exist.
+//
+// IMPORTANT: "CREATE TABLE IF NOT EXISTS" does nothing when the table already
+// exists. Whenever a column is added to a CREATE TABLE statement, a matching
+// "ALTER TABLE ... ADD COLUMN IF NOT EXISTS" migration must be added too, or
+// older databases will keep the old schema.
 var (
 	doctorsDDL = `
 	CREATE TABLE IF NOT EXISTS doctors (
@@ -364,6 +368,19 @@ var (
 	);
 	`
 
+	// Idempotent migration: brings older conversations tables up to date.
+	// Fixes: pq: column "updated_at" does not exist.
+	conversationsAddColumnsDDL = `
+	ALTER TABLE conversations
+		ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+	`
+
+	conversationsUpdatedIndexDDL = `
+	CREATE INDEX IF NOT EXISTS idx_conversations_updated
+	ON conversations(updated_at DESC);
+	`
+
 	messagesDDL = `
 	CREATE TABLE IF NOT EXISTS messages (
 		id BIGSERIAL PRIMARY KEY,
@@ -375,6 +392,12 @@ var (
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		CHECK (NULLIF(TRIM(message), '') IS NOT NULL OR image_data IS NOT NULL)
 	);
+	`
+
+	// Idempotent migration: brings older messages tables up to date.
+	messagesAddColumnsDDL = `
+	ALTER TABLE messages
+		ADD COLUMN IF NOT EXISTS image_data TEXT;
 	`
 
 	messagesIndexDDL = `
@@ -451,11 +474,14 @@ func CreateTables() error {
 
 	queries := []string{
 		doctorsDDL,
+		doctorsAddIsOnlineDDL,
 		patientsDDL,
 		conversationsDDL,
+		conversationsAddColumnsDDL,
+		conversationsUpdatedIndexDDL,
 		messagesDDL,
+		messagesAddColumnsDDL,
 		messagesIndexDDL,
-		doctorsAddIsOnlineDDL,
 		workPlacesDDL,
 		workSchedulesDDL,
 		workSchedulesIndexDDL,
@@ -501,16 +527,16 @@ type Doctor struct {
 
 // WorkPlace represents one clinic or hospital a doctor works at.
 type WorkPlace struct {
-	ID        string   `json:"id"`
-	DoctorID  string   `json:"doctor_id"`
-	PlaceType string   `json:"place_type"`
-	Name      string   `json:"name"`
-	Address   string   `json:"address"`
-	Phone     *string  `json:"phone,omitempty"`
-	ExamPrice *float64 `json:"exam_price,omitempty"`
+	ID        string         `json:"id"`
+	DoctorID  string         `json:"doctor_id"`
+	PlaceType string         `json:"place_type"`
+	Name      string         `json:"name"`
+	Address   string         `json:"address"`
+	Phone     *string        `json:"phone,omitempty"`
+	ExamPrice *float64       `json:"exam_price,omitempty"`
 	Schedules []WorkSchedule `json:"schedules,omitempty"`
-	CreatedAt string   `json:"created_at"`
-	UpdatedAt string   `json:"updated_at"`
+	CreatedAt string         `json:"created_at"`
+	UpdatedAt string         `json:"updated_at"`
 }
 
 // WorkSchedule represents one time slot for a specific day of the week.
@@ -529,13 +555,13 @@ type WorkSchedule struct {
 // CreateWorkPlaceRequest is the JSON body for POST /work-places.
 // Schedules is optional; each item may carry 1 or 2 time slots per day.
 type CreateWorkPlaceRequest struct {
-	DoctorID  string                `json:"doctor_id"`
-	PlaceType string                `json:"place_type"`
-	Name      string                `json:"name"`
-	Address   string                `json:"address"`
-	Phone     string                `json:"phone"`
-	ExamPrice *float64              `json:"exam_price"`
-	Schedules []WorkScheduleInput   `json:"schedules"`
+	DoctorID  string              `json:"doctor_id"`
+	PlaceType string              `json:"place_type"`
+	Name      string              `json:"name"`
+	Address   string              `json:"address"`
+	Phone     string              `json:"phone"`
+	ExamPrice *float64            `json:"exam_price"`
+	Schedules []WorkScheduleInput `json:"schedules"`
 }
 
 // UpdateWorkPlaceRequest is the JSON body for PUT /work-places/:id.
@@ -1916,7 +1942,11 @@ func insertMessage(conversationID, senderType, senderID, message string, imageDa
 	}
 	m.CreatedAt = createdAt.Format(time.RFC3339)
 
-	_, _ = db.Exec(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, conversationID)
+	// Bump the conversation so it sorts first. A failure here must not fail the
+	// send, but it should never be silent either.
+	if _, err := db.Exec(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, conversationID); err != nil {
+		log.Println("failed to touch conversation:", err)
+	}
 	return m, nil
 }
 
