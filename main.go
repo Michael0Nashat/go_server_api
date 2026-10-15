@@ -149,6 +149,14 @@ func main() {
 		UpdateDoctorStatus,
 	)
 
+	// Save the doctor's chat profile picture. The SvelteKit dashboard proxies
+	// this as POST /api/doctors/:id/chat-image (see src/routes/api/doctors).
+	router.HandleBlocking(
+		breeze.POST,
+		"/doctors/:id/chat-image",
+		SaveDoctorChatImage,
+	)
+
 	// =========================
 	// Patients API
 	// =========================
@@ -188,6 +196,14 @@ func main() {
 		breeze.DELETE,
 		"/patients/:id",
 		DeletePatient,
+	)
+
+	// Save the patient's chat profile picture. The SvelteKit dashboard proxies
+	// this as POST /api/patients/:id/chat-image (see src/routes/api/patients).
+	router.HandleBlocking(
+		breeze.POST,
+		"/patients/:id/chat-image",
+		SavePatientChatImage,
 	)
 
 	// =========================
@@ -425,6 +441,24 @@ var (
 	END$$;
 	`
 
+	// Idempotent migration: adds first_message to existing conversations tables.
+	// first_message holds the JSON payload of the *first* message posted in the
+	// conversation (typically the sender's profile picture that opened the chat).
+	// Older databases created before this column existed would never gain it
+	// via "CREATE TABLE IF NOT EXISTS", so it is added explicitly.
+	conversationsFirstMessageDDL = `
+	ALTER TABLE conversations
+		ADD COLUMN IF NOT EXISTS first_message JSONB;
+	`
+
+	// Idempotent migration: adds photo to existing patients tables.
+	// Patients are created through a JSON-only endpoint, so the picture is
+	// attached afterwards via POST /patients/:id/chat-image.
+	patientsPhotoDDL = `
+	ALTER TABLE patients
+		ADD COLUMN IF NOT EXISTS photo TEXT;
+	`
+
 	// work_places stores each clinic / hospital a doctor works at.
 	workPlacesDDL = `
 	CREATE TABLE IF NOT EXISTS work_places (
@@ -483,8 +517,10 @@ func CreateTables() error {
 		doctorsDDL,
 		doctorsAddIsOnlineDDL,
 		patientsDDL,
+		patientsPhotoDDL,
 		conversationsDDL,
 		conversationsAddColumnsDDL,
+		conversationsFirstMessageDDL,
 		conversationsUpdatedIndexDDL,
 		messagesDDL,
 		messagesAddColumnsDDL,
@@ -1306,10 +1342,14 @@ func DeleteDoctor(ctx *breeze.Context) {
 // Patient mirrors a row of the patients table. The id is a BIGSERIAL, so it
 // travels as a JSON number and is read from the URL with strconv.ParseInt.
 type Patient struct {
-	ID        int64  `json:"id"`
-	Username  string `json:"username"`
-	Phone     string `json:"phone"`
-	CreatedAt string `json:"created_at"`
+	ID        int64   `json:"id"`
+	Username  string  `json:"username"`
+	Phone     string  `json:"phone"`
+	CreatedAt string  `json:"created_at"`
+	// Photo holds the patient's profile / chat picture as a base64 data URL,
+	// uploaded through POST /patients/:id/chat-image. NULL until the patient
+	// saves one, so it travels as an optional field (omitted when empty).
+	Photo *string `json:"photo,omitempty"`
 }
 
 // CreatePatientRequest is the JSON body accepted by POST /patients.
@@ -1509,6 +1549,7 @@ func GetPatients(ctx *breeze.Context) {
 			id,
 			username,
 			phone,
+			photo,
 			created_at
 		FROM patients
 		ORDER BY created_at DESC
@@ -1529,12 +1570,14 @@ func GetPatients(ctx *breeze.Context) {
 	for rows.Next() {
 
 		var p Patient
+		var photo sql.NullString
 		var createdAt time.Time
 
 		err := rows.Scan(
 			&p.ID,
 			&p.Username,
 			&p.Phone,
+			&photo,
 			&createdAt,
 		)
 
@@ -1544,6 +1587,10 @@ func GetPatients(ctx *breeze.Context) {
 				"error": err.Error(),
 			})
 			return
+		}
+
+		if photo.Valid && photo.String != "" {
+			p.Photo = &photo.String
 		}
 
 		p.CreatedAt = createdAt.Format(time.RFC3339)
@@ -1581,6 +1628,7 @@ func GetPatient(ctx *breeze.Context) {
 	}
 
 	var p Patient
+	var photo sql.NullString
 	var createdAt time.Time
 
 	err = db.QueryRow(`
@@ -1588,6 +1636,7 @@ func GetPatient(ctx *breeze.Context) {
 			id,
 			username,
 			phone,
+			photo,
 			created_at
 		FROM patients
 		WHERE id = $1
@@ -1595,6 +1644,7 @@ func GetPatient(ctx *breeze.Context) {
 		&p.ID,
 		&p.Username,
 		&p.Phone,
+		&photo,
 		&createdAt,
 	)
 
@@ -1612,6 +1662,10 @@ func GetPatient(ctx *breeze.Context) {
 			"error": err.Error(),
 		})
 		return
+	}
+
+	if photo.Valid && photo.String != "" {
+		p.Photo = &photo.String
 	}
 
 	p.CreatedAt = createdAt.Format(time.RFC3339)
@@ -1785,11 +1839,17 @@ func DeletePatient(ctx *breeze.Context) {
 // ============================================================
 
 type Conversation struct {
-	ID        string `json:"id"`
-	PatientID int64  `json:"patient_id"`
-	DoctorID  string `json:"doctor_id"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	ID        string            `json:"id"`
+	PatientID int64             `json:"patient_id"`
+	DoctorID  string            `json:"doctor_id"`
+	CreatedAt string            `json:"created_at"`
+	UpdatedAt string            `json:"updated_at"`
+	// FirstMessage is the JSON payload of the *first* message posted in this
+	// conversation. It is NULL until someone posts one (usually a profile
+	// picture through POST /doctors/:id/chat-image or /patients/:id/chat-image).
+	// A pointer to json.RawMessage keeps the value opaquely as raw JSON so it
+	// can be re-emitted without re-marshalling an empty object.
+	FirstMessage *json.RawMessage `json:"first_message,omitempty"`
 }
 
 type Message struct {
@@ -1866,15 +1926,36 @@ func CreateConversation(ctx *breeze.Context) {
 		return
 	}
 
+	// Carry the doctor's stored profile picture into the conversation's
+	// first_message column so the peer can render the opening image even
+	// before any real message is sent. The column is JSONB; we store a JSON
+	// object {"image": "<data URL>"}, or NULL when the doctor has none.
+	// COALESCE in the ON CONFLICT branch keeps any existing first_message
+	// intact on re-opens.
+	var doctorPhoto sql.NullString
+	if err := db.QueryRow(`SELECT profile_image FROM doctors WHERE id = $1`, payload.DoctorID).Scan(&doctorPhoto); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to load doctor photo", "details": err.Error()})
+		return
+	}
+
+	var firstMessage interface{}
+	if doctorPhoto.Valid && strings.TrimSpace(doctorPhoto.String) != "" {
+		dataURL := doctorPhoto.String
+		firstMessage, _ = json.Marshal(map[string]string{"image": dataURL})
+	}
+
 	var c Conversation
 	var createdAt, updatedAt time.Time
 	err := db.QueryRow(`
-		INSERT INTO conversations (patient_id, doctor_id)
-		VALUES ($1, $2)
+		INSERT INTO conversations (patient_id, doctor_id, first_message)
+		VALUES ($1, $2, $3)
 		ON CONFLICT (patient_id, doctor_id)
-		DO UPDATE SET updated_at = conversations.updated_at
+		DO UPDATE SET
+			updated_at = conversations.updated_at,
+			first_message = COALESCE(conversations.first_message, EXCLUDED.first_message)
 		RETURNING id, patient_id, doctor_id, created_at, updated_at
-	`, payload.PatientID, payload.DoctorID).Scan(
+	`, payload.PatientID, payload.DoctorID, firstMessage).Scan(
 		&c.ID, &c.PatientID, &c.DoctorID, &createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -1894,7 +1975,7 @@ func GetConversations(ctx *breeze.Context) {
 	doctorID := strings.TrimSpace(ctx.Query("doctor_id"))
 
 	query := `
-		SELECT id, patient_id, doctor_id, created_at, updated_at
+		SELECT id, patient_id, doctor_id, first_message, created_at, updated_at
 		FROM conversations
 	`
 	args := []interface{}{}
@@ -1930,14 +2011,19 @@ func GetConversations(ctx *breeze.Context) {
 	conversations := []Conversation{}
 	for rows.Next() {
 		var c Conversation
+		var firstMessage []byte
 		var createdAt, updatedAt time.Time
-		if err := rows.Scan(&c.ID, &c.PatientID, &c.DoctorID, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.PatientID, &c.DoctorID, &firstMessage, &createdAt, &updatedAt); err != nil {
 			ctx.Status(500)
 			ctx.JSON(map[string]interface{}{"error": err.Error()})
 			return
 		}
 		c.CreatedAt = createdAt.Format(time.RFC3339)
 		c.UpdatedAt = updatedAt.Format(time.RFC3339)
+		if len(firstMessage) > 0 {
+			raw := json.RawMessage(firstMessage)
+			c.FirstMessage = &raw
+		}
 		conversations = append(conversations, c)
 	}
 
@@ -2135,6 +2221,165 @@ func SendImageMessage(ctx *breeze.Context) {
 	broadcastChatMessage(m)
 	ctx.Status(201)
 	ctx.JSON(map[string]interface{}{"message": m})
+}
+
+// ============================================================
+// Save Doctor Chat Image
+// ============================================================
+
+// SaveDoctorChatImage handles POST /doctors/:id/chat-image.
+//
+// The doctor uploads a picture (multipart field "image", 5 MB max, JPEG/PNG/
+// WebP). It is persisted as:
+//   1. The doctor's profile_image column (so the patient side can render it
+//      in the chat header), and
+//   2. The doctor's *next* conversation row's first_message column, so the
+//      patient sees the opening image even before a real message is sent.
+//
+// If the doctor has no conversation yet, only the profile_image is stored and
+// the first_message is written the next time CreateConversation runs.
+func SaveDoctorChatImage(ctx *breeze.Context) {
+	doctorID := ctx.Param("id")
+	if doctorID == "" {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{"error": "doctor id is required"})
+		return
+	}
+
+	files, _, err := ctx.ParseMultipart(MaxImageSize)
+	if err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{"error": "Invalid multipart form", "details": err.Error()})
+		return
+	}
+
+	imageData, err := readUploadedFile(files, "image", MaxImageSize, []string{
+		"image/jpeg", "image/png", "image/webp",
+	}, true)
+	if err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	// Verify the doctor exists and load the photo for first_message.
+	var exists bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM doctors WHERE id = $1)`, doctorID).Scan(&exists); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		return
+	}
+	if !exists {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{"error": "Doctor not found"})
+		return
+	}
+
+	// Persist the picture on the doctor row so the patient dashboard can
+	// render it in the chat header.
+	if _, err := db.Exec(`
+		UPDATE doctors
+		SET profile_image = $1, updated_at = NOW()
+		WHERE id = $2
+	`, imageData, doctorID); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to save doctor image", "details": err.Error()})
+		return
+	}
+
+	// Upsert the doctor's first_message on any existing conversation. The
+	// first_message column is JSONB, so we store a JSON object
+	// {"image": "<data URL>"} — NULL when there is no conversation yet.
+	firstMessage, _ := json.Marshal(map[string]string{"image": *imageData})
+	_, _ = db.Exec(`
+		UPDATE conversations
+		SET first_message = $1, updated_at = NOW()
+		WHERE doctor_id = $2
+	`, firstMessage, doctorID)
+
+	ctx.JSON(map[string]interface{}{
+		"message": "Doctor image saved",
+		"doctor":  map[string]interface{}{"id": doctorID, "image": *imageData},
+	})
+}
+
+// ============================================================
+// Save Patient Chat Image
+// ============================================================
+
+// SavePatientChatImage handles POST /patients/:id/chat-image.
+//
+// The patient uploads a picture (multipart field "image", 5 MB max,
+// JPEG/PNG/WebP). It is persisted as:
+//   1. The patient's photo column (so the doctor side can render it in the
+//      chat header), and
+//   2. The patient's *next* conversation row's first_message column, so the
+//      doctor sees the opening image even before a real message is sent.
+//
+// If the patient has no conversation yet, only the photo is stored and the
+// first_message is written the next time CreateConversation runs.
+func SavePatientChatImage(ctx *breeze.Context) {
+	patientIDStr := ctx.Param("id")
+	patientID, err := strconv.ParseInt(patientIDStr, 10, 64)
+	if err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{"error": "Invalid patient id"})
+		return
+	}
+
+	files, _, err := ctx.ParseMultipart(MaxImageSize)
+	if err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{"error": "Invalid multipart form", "details": err.Error()})
+		return
+	}
+
+	imageData, err := readUploadedFile(files, "image", MaxImageSize, []string{
+		"image/jpeg", "image/png", "image/webp",
+	}, true)
+	if err != nil {
+		ctx.Status(400)
+		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	// Verify the patient exists.
+	var exists bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM patients WHERE id = $1)`, patientID).Scan(&exists); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		return
+	}
+	if !exists {
+		ctx.Status(404)
+		ctx.JSON(map[string]interface{}{"error": "Patient not found"})
+		return
+	}
+
+	// Persist the picture on the patient row so the doctor dashboard can
+	// render it in the chat header.
+	if _, err := db.Exec(`
+		UPDATE patients SET photo = $1 WHERE id = $2
+	`, imageData, patientID); err != nil {
+		ctx.Status(500)
+		ctx.JSON(map[string]interface{}{"error": "Failed to save patient image", "details": err.Error()})
+		return
+	}
+
+	// Upsert the patient's first_message on any existing conversation. The
+	// first_message column is JSONB, so we store a JSON object
+	// {"image": "<data URL>"} — NULL when there is no conversation yet.
+	firstMessage, _ := json.Marshal(map[string]string{"image": *imageData})
+	_, _ = db.Exec(`
+		UPDATE conversations
+		SET first_message = $1, updated_at = NOW()
+		WHERE patient_id = $2
+	`, firstMessage, patientID)
+
+	ctx.JSON(map[string]interface{}{
+		"message":  "Patient image saved",
+		"patient":  map[string]interface{}{"id": patientID, "image": *imageData},
+	})
 }
 
 func broadcastChatMessage(m Message) {
