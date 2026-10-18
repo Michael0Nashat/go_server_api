@@ -1879,6 +1879,10 @@ type ChatWSRequest struct {
 	SenderType     string `json:"sender_type"`
 	SenderID       string `json:"sender_id"`
 	Message        string `json:"message"`
+	// Optional base64 data URL (e.g. "data:image/jpeg;base64,...").
+	// When present, the message is stored with image_data instead of a
+	// plain-text body; the text field may still carry a caption.
+	Image string `json:"image,omitempty"`
 }
 
 type ChatWSEvent struct {
@@ -2459,8 +2463,12 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 			_ = conn.SendText(`{"type":"error","error":"Subscribe to the conversation first"}`)
 			return
 		}
-		if req.SenderType == "" || req.SenderID == "" || strings.TrimSpace(req.Message) == "" {
-			_ = conn.SendText(`{"type":"error","error":"sender_type, sender_id and message are required"}`)
+		if req.SenderType == "" || req.SenderID == "" {
+			_ = conn.SendText(`{"type":"error","error":"sender_type and sender_id are required"}`)
+			return
+		}
+		if strings.TrimSpace(req.Message) == "" && req.Image == "" {
+			_ = conn.SendText(`{"type":"error","error":"message or image is required"}`)
 			return
 		}
 		ok, err := conversationExistsForSender(req.ConversationID, req.SenderType, req.SenderID)
@@ -2468,7 +2476,12 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 			_ = conn.SendText(`{"type":"error","error":"Sender is not a member of this conversation"}`)
 			return
 		}
-		m, err := insertMessage(req.ConversationID, req.SenderType, req.SenderID, req.Message, nil)
+		var imgPtr *string
+		if strings.TrimSpace(req.Image) != "" {
+			v := req.Image
+			imgPtr = &v
+		}
+		m, err := insertMessage(req.ConversationID, req.SenderType, req.SenderID, req.Message, imgPtr)
 		if err != nil {
 			_ = conn.SendText(`{"type":"error","error":"Failed to save message"}`)
 			return
