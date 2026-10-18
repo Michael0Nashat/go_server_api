@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -42,28 +43,37 @@ const (
 	MaxFileSize  = 10 * 1024 * 1024 // 10 MB
 )
 
+var uuidRegexp = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// isValidUUID avoids Postgres "invalid input syntax for type uuid" (a 500)
+// by rejecting malformed ids up front with a 400.
+func isValidUUID(s string) bool {
+	return uuidRegexp.MatchString(s)
+}
+
+// fail writes a JSON error with the right HTTP status.
+func fail(ctx *breeze.Context, status int, msg string, err error) {
+	ctx.Status(status)
+	body := map[string]interface{}{"error": msg}
+	if err != nil {
+		body["details"] = err.Error()
+	}
+	ctx.JSON(body)
+}
+
 // ============================================================
 // Main
 // ============================================================
 
 func main() {
 
-	// =========================
-	// Environment
-	// =========================
-
 	if err := godotenv.Load(); err != nil {
 		log.Println(".env file not found")
 	}
 
-	// =========================
-	// Database
-	// =========================
-
 	if err := InitDB(); err != nil {
 		log.Fatal("Database connection failed:", err)
 	}
-
 	defer db.Close()
 
 	if err := CreateTables(); err != nil {
@@ -72,18 +82,10 @@ func main() {
 
 	log.Println("Database connected successfully")
 
-	// =========================
-	// Router
-	// =========================
-
 	router := breeze.NewRouter()
 
 	router.Use(middleware.RecoveryMiddleware())
 	router.Use(middleware.LoggingMiddleware())
-
-	// =========================
-	// Home
-	// =========================
 
 	router.Handle(breeze.GET, "/", func(ctx *breeze.Context) {
 		ctx.JSON(map[string]interface{}{
@@ -92,165 +94,68 @@ func main() {
 		})
 	})
 
-	// =========================
-	// Health
-	// =========================
-
 	router.Handle(breeze.GET, "/health", func(ctx *breeze.Context) {
 		ctx.JSON(map[string]interface{}{
 			"status": "healthy",
 		})
 	})
 
-	// =========================
-	// Doctors API
-	// =========================
-
-	router.HandleBlocking(
-		breeze.POST,
-		"/doctors",
-		CreateDoctor,
-	)
-
-	router.HandleBlocking(
-		breeze.GET,
-		"/doctors",
-		GetDoctors,
-	)
-
-	router.HandleBlocking(
-		breeze.GET,
-		"/doctors/:id",
-		GetDoctor,
-	)
-
-	router.HandleBlocking(
-		breeze.PUT,
-		"/doctors/:id",
-		UpdateDoctor,
-	)
-
-	router.HandleBlocking(
-		breeze.DELETE,
-		"/doctors/:id",
-		DeleteDoctor,
-	)
+	// ---------- Doctors ----------
+	router.HandleBlocking(breeze.POST, "/doctors", CreateDoctor)
+	router.HandleBlocking(breeze.GET, "/doctors", GetDoctors)
+	router.HandleBlocking(breeze.GET, "/doctors/:id", GetDoctor)
+	router.HandleBlocking(breeze.PUT, "/doctors/:id", UpdateDoctor)
+	router.HandleBlocking(breeze.DELETE, "/doctors/:id", DeleteDoctor)
 
 	// Static segment, so it wins over "/doctors/:id" for POST lookups.
-	router.HandleBlocking(
-		breeze.POST,
-		"/doctors/login",
-		LoginDoctor,
-	)
+	router.HandleBlocking(breeze.POST, "/doctors/login", LoginDoctor)
 
-	router.HandleBlocking(
-		breeze.PATCH,
-		"/doctors/:id/status",
-		UpdateDoctorStatus,
-	)
+	router.HandleBlocking(breeze.PATCH, "/doctors/:id/status", UpdateDoctorStatus)
 
-	// Save the doctor's chat profile picture. The SvelteKit dashboard proxies
-	// this as POST /api/doctors/:id/chat-image (see src/routes/api/doctors).
-	router.HandleBlocking(
-		breeze.POST,
-		"/doctors/:id/chat-image",
-		SaveDoctorChatImage,
-	)
+	// The SvelteKit dashboard proxies this as POST /api/doctors/:id/chat-image.
+	router.HandleBlocking(breeze.POST, "/doctors/:id/chat-image", SaveDoctorChatImage)
 
-	// =========================
-	// Patients API
-	// =========================
-
-	router.HandleBlocking(
-		breeze.POST,
-		"/patients",
-		CreatePatient,
-	)
+	// ---------- Patients ----------
+	router.HandleBlocking(breeze.POST, "/patients", CreatePatient)
 
 	// Static segment wins over "/patients/:id" for POST lookups.
-	router.HandleBlocking(
-		breeze.POST,
-		"/patients/login",
-		LoginPatient,
-	)
+	router.HandleBlocking(breeze.POST, "/patients/login", LoginPatient)
 
-	router.HandleBlocking(
-		breeze.GET,
-		"/patients",
-		GetPatients,
-	)
+	router.HandleBlocking(breeze.GET, "/patients", GetPatients)
+	router.HandleBlocking(breeze.GET, "/patients/:id", GetPatient)
+	router.HandleBlocking(breeze.PUT, "/patients/:id", UpdatePatient)
+	router.HandleBlocking(breeze.DELETE, "/patients/:id", DeletePatient)
 
-	router.HandleBlocking(
-		breeze.GET,
-		"/patients/:id",
-		GetPatient,
-	)
+	// The SvelteKit dashboard proxies this as POST /api/patients/:id/chat-image.
+	router.HandleBlocking(breeze.POST, "/patients/:id/chat-image", SavePatientChatImage)
 
-	router.HandleBlocking(
-		breeze.PUT,
-		"/patients/:id",
-		UpdatePatient,
-	)
-
-	router.HandleBlocking(
-		breeze.DELETE,
-		"/patients/:id",
-		DeletePatient,
-	)
-
-	// Save the patient's chat profile picture. The SvelteKit dashboard proxies
-	// this as POST /api/patients/:id/chat-image (see src/routes/api/patients).
-	router.HandleBlocking(
-		breeze.POST,
-		"/patients/:id/chat-image",
-		SavePatientChatImage,
-	)
-
-	// =========================
-	// Work Places API
-	// =========================
-
+	// ---------- Work Places ----------
 	router.HandleBlocking(breeze.POST, "/work-places", CreateWorkPlace)
 	router.HandleBlocking(breeze.GET, "/work-places", GetWorkPlaces)
 	router.HandleBlocking(breeze.GET, "/work-places/:id", GetWorkPlace)
 	router.HandleBlocking(breeze.PUT, "/work-places/:id", UpdateWorkPlace)
 	router.HandleBlocking(breeze.DELETE, "/work-places/:id", DeleteWorkPlace)
-
-	// Schedules nested under a work place
 	router.HandleBlocking(breeze.POST, "/work-places/:id/schedules", SetWorkSchedules)
 
-	// =========================
-	// Chat API
-	// =========================
-
+	// ---------- Chat ----------
 	router.HandleBlocking(breeze.POST, "/conversations", CreateConversation)
 	router.HandleBlocking(breeze.GET, "/conversations", GetConversations)
 	router.HandleBlocking(breeze.GET, "/conversations/:id/messages", GetMessages)
 	router.HandleBlocking(breeze.POST, "/conversations/:id/messages", SendMessage)
 	router.HandleBlocking(breeze.POST, "/conversations/:id/messages/image", SendImageMessage)
 
-	// Breeze has a native WebSocket implementation, so no Gorilla dependency is needed.
+	// Clients connect to ws://HOST:PORT/ws/chat and first send a "subscribe" message.
 	chatHandler := &breeze.WSHandlerFunc{
 		Connect: chatWSOnConnect,
 		Message: chatWSOnMessage,
 		Close:   chatWSOnClose,
 	}
-	// Clients connect to ws://HOST:PORT/ws/chat and first send a "subscribe" message.
-
-	// =========================
-	// Worker Pool
-	// =========================
 
 	pool := breeze.NewWorkerPool(runtime.NumCPU())
 	app := breeze.New(router, pool)
 	app.WebSocket("/ws/chat", chatHandler)
 
-	// =========================
-	// Port
-	// =========================
-
 	port := 3000
-
 	if envPort := os.Getenv("PORT"); envPort != "" {
 		if p, err := strconv.Atoi(envPort); err == nil {
 			port = p
@@ -271,24 +176,17 @@ func main() {
 func InitDB() error {
 
 	databaseURL := os.Getenv("DATABASE_URL")
-
 	if databaseURL == "" {
 		return fmt.Errorf("DATABASE_URL is not set")
 	}
 
 	var err error
-
 	db, err = sql.Open("postgres", databaseURL)
-
 	if err != nil {
 		return err
 	}
 
-	if err := db.Ping(); err != nil {
-		return err
-	}
-
-	return nil
+	return db.Ping()
 }
 
 // ============================================================
@@ -303,6 +201,10 @@ func InitDB() error {
 // "ALTER TABLE ... ADD COLUMN IF NOT EXISTS" migration must be added too, or
 // older databases will keep the old schema.
 var (
+	// gen_random_uuid() is built in on PostgreSQL 13+; older versions need pgcrypto.
+	// This may fail without superuser rights, so CreateTables only logs the error.
+	pgcryptoDDL = `CREATE EXTENSION IF NOT EXISTS pgcrypto;`
+
 	doctorsDDL = `
 	CREATE TABLE IF NOT EXISTS doctors (
 		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -371,6 +273,12 @@ var (
 	);
 	`
 
+	// Idempotent migration: adds is_online to existing doctors tables.
+	doctorsAddIsOnlineDDL = `
+	ALTER TABLE doctors
+		ADD COLUMN IF NOT EXISTS is_online BOOLEAN NOT NULL DEFAULT FALSE;
+	`
+
 	patientsDDL = `
 	CREATE TABLE IF NOT EXISTS patients (
 		id BIGSERIAL PRIMARY KEY,
@@ -378,6 +286,12 @@ var (
 		phone VARCHAR(20) NOT NULL UNIQUE,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	`
+
+	// Idempotent migration: adds photo to existing patients tables.
+	patientsPhotoDDL = `
+	ALTER TABLE patients
+		ADD COLUMN IF NOT EXISTS photo TEXT;
 	`
 
 	conversationsDDL = `
@@ -391,12 +305,17 @@ var (
 	);
 	`
 
-	// Idempotent migration: brings older conversations tables up to date.
-	// Fixes: pq: column "updated_at" does not exist.
 	conversationsAddColumnsDDL = `
 	ALTER TABLE conversations
 		ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+	`
+
+	// first_message holds the JSON payload {"image": "<data URL>"} of the
+	// opening picture of the conversation.
+	conversationsFirstMessageDDL = `
+	ALTER TABLE conversations
+		ADD COLUMN IF NOT EXISTS first_message JSONB;
 	`
 
 	conversationsUpdatedIndexDDL = `
@@ -417,7 +336,6 @@ var (
 	);
 	`
 
-	// Idempotent migration: brings older messages tables up to date.
 	messagesAddColumnsDDL = `
 	ALTER TABLE messages
 		ADD COLUMN IF NOT EXISTS image_data TEXT;
@@ -428,38 +346,6 @@ var (
 	ON messages(conversation_id, created_at, id);
 	`
 
-	// Idempotent migration: adds is_online to existing doctors tables.
-	doctorsAddIsOnlineDDL = `
-	DO $$
-	BEGIN
-		IF NOT EXISTS (
-			SELECT 1 FROM information_schema.columns
-			WHERE table_name = 'doctors' AND column_name = 'is_online'
-		) THEN
-			ALTER TABLE doctors ADD COLUMN is_online BOOLEAN NOT NULL DEFAULT FALSE;
-		END IF;
-	END$$;
-	`
-
-	// Idempotent migration: adds first_message to existing conversations tables.
-	// first_message holds the JSON payload of the *first* message posted in the
-	// conversation (typically the sender's profile picture that opened the chat).
-	// Older databases created before this column existed would never gain it
-	// via "CREATE TABLE IF NOT EXISTS", so it is added explicitly.
-	conversationsFirstMessageDDL = `
-	ALTER TABLE conversations
-		ADD COLUMN IF NOT EXISTS first_message JSONB;
-	`
-
-	// Idempotent migration: adds photo to existing patients tables.
-	// Patients are created through a JSON-only endpoint, so the picture is
-	// attached afterwards via POST /patients/:id/chat-image.
-	patientsPhotoDDL = `
-	ALTER TABLE patients
-		ADD COLUMN IF NOT EXISTS photo TEXT;
-	`
-
-	// work_places stores each clinic / hospital a doctor works at.
 	workPlacesDDL = `
 	CREATE TABLE IF NOT EXISTS work_places (
 		id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -478,9 +364,8 @@ var (
 	);
 	`
 
-	// work_schedules stores weekly availability slots for a work place.
-	// Each row is one time slot for one day of the week.
-	// A day can have two rows (two periods) or zero rows (day off).
+	// One row = one time slot for one day (0 = السبت ... 6 = الجمعة).
+	// A day can have two rows (two periods) or an is_off row (day off).
 	workSchedulesDDL = `
 	CREATE TABLE IF NOT EXISTS work_schedules (
 		id            BIGSERIAL PRIMARY KEY,
@@ -488,12 +373,9 @@ var (
 
 		day_of_week   SMALLINT NOT NULL
 			CHECK (day_of_week BETWEEN 0 AND 6),
-			-- 0 = السبت, 1 = الأحد, 2 = الاثنين, 3 = الثلاثاء,
-			-- 4 = الأربعاء, 5 = الخميس, 6 = الجمعة
 
 		is_off        BOOLEAN NOT NULL DEFAULT FALSE,
 
-		-- NULL when is_off = TRUE
 		from_time     TIME,
 		to_time       TIME,
 
@@ -512,6 +394,11 @@ var (
 )
 
 func CreateTables() error {
+
+	// Best effort: only needed on PostgreSQL < 13.
+	if _, err := db.Exec(pgcryptoDDL); err != nil {
+		log.Println("pgcrypto extension not enabled (ignore on PostgreSQL 13+):", err)
+	}
 
 	queries := []string{
 		doctorsDDL,
@@ -540,7 +427,7 @@ func CreateTables() error {
 }
 
 // ============================================================
-// Doctor Request
+// Types
 // ============================================================
 
 type Doctor struct {
@@ -564,10 +451,6 @@ type Doctor struct {
 	UpdatedAt            string  `json:"updated_at"`
 }
 
-// ============================================================
-// Work Place & Schedule — Types
-// ============================================================
-
 // WorkPlace represents one clinic or hospital a doctor works at.
 type WorkPlace struct {
 	ID        string         `json:"id"`
@@ -583,8 +466,6 @@ type WorkPlace struct {
 }
 
 // WorkSchedule represents one time slot for a specific day of the week.
-// A day with is_off = true has no from/to times.
-// A day can have up to two rows (two periods) in the table.
 type WorkSchedule struct {
 	ID          int64   `json:"id"`
 	WorkPlaceID string  `json:"work_place_id"`
@@ -596,7 +477,6 @@ type WorkSchedule struct {
 }
 
 // CreateWorkPlaceRequest is the JSON body for POST /work-places.
-// Schedules is optional; each item may carry 1 or 2 time slots per day.
 type CreateWorkPlaceRequest struct {
 	DoctorID  string              `json:"doctor_id"`
 	PlaceType string              `json:"place_type"`
@@ -621,8 +501,8 @@ type UpdateWorkPlaceRequest struct {
 type WorkScheduleInput struct {
 	DayOfWeek int    `json:"day_of_week"`
 	IsOff     bool   `json:"is_off"`
-	FromTime  string `json:"from_time"` // "HH:MM" or ""
-	ToTime    string `json:"to_time"`   // "HH:MM" or ""
+	FromTime  string `json:"from_time"`
+	ToTime    string `json:"to_time"`
 }
 
 // arabicDayName maps 0-indexed day (0=Saturday) to the Arabic label.
@@ -653,11 +533,7 @@ func CreateDoctor(ctx *breeze.Context) {
 
 	files, fields, err := ctx.ParseMultipart(MaxFileSize)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error":   "Invalid multipart form",
-			"details": err.Error(),
-		})
+		fail(ctx, 400, "Invalid multipart form", err)
 		return
 	}
 
@@ -678,10 +554,6 @@ func CreateDoctor(ctx *breeze.Context) {
 	professionalDegree := formValue("professional_degree")
 	governorate := formValue("governorate")
 
-	// =========================
-	// Required fields
-	// =========================
-
 	required := map[string]string{
 		"full_name":            fullName,
 		"phone":                phone,
@@ -695,108 +567,38 @@ func CreateDoctor(ctx *breeze.Context) {
 
 	for field, value := range required {
 		if strings.TrimSpace(value) == "" {
-			ctx.JSON(map[string]interface{}{
-				"error": field + " is required",
-			})
+			fail(ctx, 400, field+" is required", nil)
 			return
 		}
 	}
 
-	// =========================
-	// Profile Image
-	// =========================
-
-	profileImage, err := readUploadedFile(
-		files,
-		"profile_image",
-		MaxImageSize,
-		[]string{
-			"image/jpeg",
-			"image/png",
-		},
-		false,
-	)
-
+	profileImage, err := readUploadedFile(files, "profile_image", MaxImageSize,
+		[]string{"image/jpeg", "image/png", "image/webp"}, false)
 	if err != nil {
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 400, err.Error(), nil)
 		return
 	}
 
-	// =========================
-	// Syndicate Card
-	// =========================
-
-	syndicateCard, err := readUploadedFile(
-		files,
-		"medical_syndicate_card",
-		MaxFileSize,
-		[]string{
-			"image/jpeg",
-			"image/png",
-			"application/pdf",
-		},
-		true,
-	)
-
+	syndicateCard, err := readUploadedFile(files, "medical_syndicate_card", MaxFileSize,
+		[]string{"image/jpeg", "image/png", "application/pdf"}, true)
 	if err != nil {
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 400, err.Error(), nil)
 		return
 	}
 
-	// =========================
-	// National ID
-	// =========================
-
-	nationalIDCard, err := readUploadedFile(
-		files,
-		"national_id_card",
-		MaxFileSize,
-		[]string{
-			"image/jpeg",
-			"image/png",
-			"application/pdf",
-		},
-		true,
-	)
-
+	nationalIDCard, err := readUploadedFile(files, "national_id_card", MaxFileSize,
+		[]string{"image/jpeg", "image/png", "application/pdf"}, true)
 	if err != nil {
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 400, err.Error(), nil)
 		return
 	}
 
-	// =========================
-	// Specialty Certificate
-	// Optional
-	// =========================
-
-	specialtyCertificate, err := readUploadedFile(
-		files,
-		"specialty_certificate",
-		MaxFileSize,
-		[]string{
-			"image/jpeg",
-			"image/png",
-			"application/pdf",
-		},
-		false,
-	)
-
+	specialtyCertificate, err := readUploadedFile(files, "specialty_certificate", MaxFileSize,
+		[]string{"image/jpeg", "image/png", "application/pdf"}, false)
 	if err != nil {
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 400, err.Error(), nil)
 		return
 	}
-
-	// =========================
-	// Insert
-	// =========================
 
 	query := `
 		INSERT INTO doctors (
@@ -823,15 +625,14 @@ func CreateDoctor(ctx *breeze.Context) {
 	`
 
 	var id string
-	var createdAt time.Time
-	var updatedAt time.Time
+	var createdAt, updatedAt time.Time
 
 	err = db.QueryRow(
 		query,
 		profileImage,
 		fullName,
 		phone,
-		email,
+		strings.TrimSpace(email),
 		nationalID,
 		medicalSyndicateID,
 		birthDate,
@@ -841,20 +642,18 @@ func CreateDoctor(ctx *breeze.Context) {
 		syndicateCard,
 		nationalIDCard,
 		specialtyCertificate,
-	).Scan(
-		&id,
-		&createdAt,
-		&updatedAt,
-	)
+	).Scan(&id, &createdAt, &updatedAt)
 
 	if err != nil {
-		ctx.JSON(map[string]interface{}{
-			"error":   "Failed to create doctor",
-			"details": err.Error(),
-		})
+		if isUniqueViolation(err) {
+			fail(ctx, 409, "Phone, email, national_id or medical_syndicate_id already exists", nil)
+			return
+		}
+		fail(ctx, 500, "Failed to create doctor", err)
 		return
 	}
 
+	ctx.Status(201)
 	ctx.JSON(map[string]interface{}{
 		"message": "Doctor registered successfully",
 		"doctor": map[string]interface{}{
@@ -890,25 +689,19 @@ func GetDoctors(ctx *breeze.Context) {
 		FROM doctors
 		ORDER BY created_at DESC
 	`)
-
 	if err != nil {
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 500, "Failed to load doctors", err)
 		return
 	}
-
 	defer rows.Close()
 
-	var doctors []Doctor
+	doctors := []Doctor{}
 
 	for rows.Next() {
 
 		var d Doctor
 		var email sql.NullString
-
-		var createdAt time.Time
-		var updatedAt time.Time
+		var createdAt, updatedAt time.Time
 
 		err := rows.Scan(
 			&d.ID,
@@ -925,11 +718,8 @@ func GetDoctors(ctx *breeze.Context) {
 			&createdAt,
 			&updatedAt,
 		)
-
 		if err != nil {
-			ctx.JSON(map[string]interface{}{
-				"error": err.Error(),
-			})
+			fail(ctx, 500, "Failed to read doctors", err)
 			return
 		}
 
@@ -942,6 +732,11 @@ func GetDoctors(ctx *breeze.Context) {
 		d.UpdatedAt = updatedAt.Format(time.RFC3339)
 
 		doctors = append(doctors, d)
+	}
+
+	if err := rows.Err(); err != nil {
+		fail(ctx, 500, "Failed to read doctors", err)
+		return
 	}
 
 	ctx.JSON(map[string]interface{}{
@@ -957,12 +752,14 @@ func GetDoctors(ctx *breeze.Context) {
 func GetDoctor(ctx *breeze.Context) {
 
 	id := ctx.Param("id")
+	if !isValidUUID(id) {
+		fail(ctx, 400, "Invalid doctor id", nil)
+		return
+	}
 
 	var d Doctor
-
 	var email sql.NullString
-	var createdAt time.Time
-	var updatedAt time.Time
+	var createdAt, updatedAt time.Time
 
 	err := db.QueryRow(`
 		SELECT
@@ -1006,16 +803,11 @@ func GetDoctor(ctx *breeze.Context) {
 	)
 
 	if err == sql.ErrNoRows {
-		ctx.JSON(map[string]interface{}{
-			"error": "Doctor not found",
-		})
+		fail(ctx, 404, "Doctor not found", nil)
 		return
 	}
-
 	if err != nil {
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 500, "Failed to load doctor", err)
 		return
 	}
 
@@ -1033,66 +825,40 @@ func GetDoctor(ctx *breeze.Context) {
 }
 
 // ============================================================
-// Login Request
+// Login Doctor
 // ============================================================
 
-// LoginDoctor authenticates a doctor from the two fields the login form sends.
-// Both are matched case-insensitively and whitespace-trimmed, because the
-// values are typed by hand and Arabic names are often entered inconsistently.
+// LoginRequest: both fields are matched case-insensitively and
+// whitespace-trimmed, because the values are typed by hand.
 type LoginRequest struct {
 	FullName string `json:"full_name"`
 	Email    string `json:"email"`
 }
-
-// ============================================================
-// Login Doctor
-// ============================================================
 
 func LoginDoctor(ctx *breeze.Context) {
 
 	var payload LoginRequest
 
 	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error": "Invalid JSON body",
-		})
+		fail(ctx, 400, "Invalid JSON body", nil)
 		return
 	}
 
 	fullName := strings.TrimSpace(payload.FullName)
 	email := strings.ToLower(strings.TrimSpace(payload.Email))
 
-	// =========================
-	// Required fields
-	// =========================
-
 	if fullName == "" {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error": "full_name is required",
-		})
+		fail(ctx, 400, "full_name is required", nil)
 		return
 	}
-
 	if email == "" {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error": "email is required",
-		})
+		fail(ctx, 400, "email is required", nil)
 		return
 	}
-
-	// =========================
-	// Lookup
-	// =========================
 
 	var d Doctor
-
 	var emailResult sql.NullString
-
-	var createdAt time.Time
-	var updatedAt time.Time
+	var createdAt, updatedAt time.Time
 
 	err := db.QueryRow(`
 		SELECT
@@ -1128,19 +894,11 @@ func LoginDoctor(ctx *breeze.Context) {
 	)
 
 	if err == sql.ErrNoRows {
-		ctx.Status(401)
-		ctx.JSON(map[string]interface{}{
-			"error": "Invalid credentials",
-		})
+		fail(ctx, 401, "Invalid credentials", nil)
 		return
 	}
-
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error":   "Failed to log in",
-			"details": err.Error(),
-		})
+		fail(ctx, 500, "Failed to log in", err)
 		return
 	}
 
@@ -1165,14 +923,14 @@ func LoginDoctor(ctx *breeze.Context) {
 func UpdateDoctor(ctx *breeze.Context) {
 
 	id := ctx.Param("id")
+	if !isValidUUID(id) {
+		fail(ctx, 400, "Invalid doctor id", nil)
+		return
+	}
 
 	_, fields, err := ctx.ParseMultipart(MaxFileSize)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error":   "Invalid multipart form",
-			"details": err.Error(),
-		})
+		fail(ctx, 400, "Invalid multipart form", err)
 		return
 	}
 
@@ -1185,7 +943,7 @@ func UpdateDoctor(ctx *breeze.Context) {
 
 	fullName := formValue("full_name")
 	phone := formValue("phone")
-	email := formValue("email")
+	email := strings.TrimSpace(formValue("email"))
 	nationalID := formValue("national_id")
 	medicalSyndicateID := formValue("medical_syndicate_id")
 	birthDate := formValue("birth_date")
@@ -1193,7 +951,7 @@ func UpdateDoctor(ctx *breeze.Context) {
 	professionalDegree := formValue("professional_degree")
 	governorate := formValue("governorate")
 
-	_, err = db.Exec(`
+	result, err := db.Exec(`
 		UPDATE doctors
 		SET
 			full_name = $1,
@@ -1219,11 +977,17 @@ func UpdateDoctor(ctx *breeze.Context) {
 		governorate,
 		id,
 	)
-
 	if err != nil {
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		if isUniqueViolation(err) {
+			fail(ctx, 409, "Phone, email, national_id or medical_syndicate_id already exists", nil)
+			return
+		}
+		fail(ctx, 500, "Failed to update doctor", err)
+		return
+	}
+
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		fail(ctx, 404, "Doctor not found", nil)
 		return
 	}
 
@@ -1236,26 +1000,21 @@ func UpdateDoctor(ctx *breeze.Context) {
 // Update Doctor Status (Online / Offline)
 // ============================================================
 
-// UpdateDoctorStatusRequest is the JSON body for PATCH /doctors/:id/status.
 type UpdateDoctorStatusRequest struct {
 	IsOnline bool `json:"is_online"`
 }
 
-// UpdateDoctorStatus toggles the online availability flag for a doctor.
-// A doctor that sets is_online = true will appear as:
-//
-//	"أنت أونلاين متصل\n🟢 متاح للاستشارة الفورية"
 func UpdateDoctorStatus(ctx *breeze.Context) {
 
 	id := ctx.Param("id")
+	if !isValidUUID(id) {
+		fail(ctx, 400, "Invalid doctor id", nil)
+		return
+	}
 
 	var payload UpdateDoctorStatusRequest
-
 	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error": "Invalid JSON body",
-		})
+		fail(ctx, 400, "Invalid JSON body", nil)
 		return
 	}
 
@@ -1264,26 +1023,18 @@ func UpdateDoctorStatus(ctx *breeze.Context) {
 		SET is_online = $1, updated_at = NOW()
 		WHERE id = $2
 	`, payload.IsOnline, id)
-
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error":   "Failed to update doctor status",
-			"details": err.Error(),
-		})
+		fail(ctx, 500, "Failed to update doctor status", err)
 		return
 	}
 
 	rows, err := result.RowsAffected()
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 500, "Failed to update doctor status", err)
 		return
 	}
-
 	if rows == 0 {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{"error": "Doctor not found"})
+		fail(ctx, 404, "Doctor not found", nil)
 		return
 	}
 
@@ -1301,32 +1052,24 @@ func UpdateDoctorStatus(ctx *breeze.Context) {
 func DeleteDoctor(ctx *breeze.Context) {
 
 	id := ctx.Param("id")
+	if !isValidUUID(id) {
+		fail(ctx, 400, "Invalid doctor id", nil)
+		return
+	}
 
-	result, err := db.Exec(
-		"DELETE FROM doctors WHERE id = $1",
-		id,
-	)
-
+	result, err := db.Exec("DELETE FROM doctors WHERE id = $1", id)
 	if err != nil {
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 500, "Failed to delete doctor", err)
 		return
 	}
 
 	rows, err := result.RowsAffected()
-
 	if err != nil {
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 500, "Failed to delete doctor", err)
 		return
 	}
-
 	if rows == 0 {
-		ctx.JSON(map[string]interface{}{
-			"error": "Doctor not found",
-		})
+		fail(ctx, 404, "Doctor not found", nil)
 		return
 	}
 
@@ -1336,38 +1079,29 @@ func DeleteDoctor(ctx *breeze.Context) {
 }
 
 // ============================================================
-// Patient Request
+// Patients
 // ============================================================
 
 // Patient mirrors a row of the patients table. The id is a BIGSERIAL, so it
 // travels as a JSON number and is read from the URL with strconv.ParseInt.
 type Patient struct {
-	ID        int64   `json:"id"`
-	Username  string  `json:"username"`
-	Phone     string  `json:"phone"`
-	CreatedAt string  `json:"created_at"`
-	// Photo holds the patient's profile / chat picture as a base64 data URL,
-	// uploaded through POST /patients/:id/chat-image. NULL until the patient
-	// saves one, so it travels as an optional field (omitted when empty).
+	ID        int64  `json:"id"`
+	Username  string `json:"username"`
+	Phone     string `json:"phone"`
+	CreatedAt string `json:"created_at"`
+	// Photo is a base64 data URL uploaded through POST /patients/:id/chat-image.
 	Photo *string `json:"photo,omitempty"`
 }
 
-// CreatePatientRequest is the JSON body accepted by POST /patients.
 type CreatePatientRequest struct {
 	Username string `json:"username"`
 	Phone    string `json:"phone"`
 }
 
-// UpdatePatientRequest is the JSON body accepted by PUT /patients/:id. Both
-// fields are required, mirroring how UpdateDoctor replaces the whole record.
 type UpdatePatientRequest struct {
 	Username string `json:"username"`
 	Phone    string `json:"phone"`
 }
-
-// ============================================================
-// Login Patient
-// ============================================================
 
 type LoginPatientRequest struct {
 	Username string `json:"username"`
@@ -1377,152 +1111,87 @@ type LoginPatientRequest struct {
 func LoginPatient(ctx *breeze.Context) {
 
 	var payload LoginPatientRequest
-
 	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error": "Invalid JSON body",
-		})
+		fail(ctx, 400, "Invalid JSON body", nil)
 		return
 	}
 
 	username := strings.TrimSpace(payload.Username)
 	phone := strings.TrimSpace(payload.Phone)
 
-	// =========================
-	// Required fields
-	// =========================
-
-	required := map[string]string{
-		"username": username,
-		"phone":    phone,
+	if username == "" {
+		fail(ctx, 400, "username is required", nil)
+		return
 	}
-
-	for field, value := range required {
-		if value == "" {
-			ctx.Status(400)
-			ctx.JSON(map[string]interface{}{
-				"error": field + " is required",
-			})
-			return
-		}
+	if phone == "" {
+		fail(ctx, 400, "phone is required", nil)
+		return
 	}
-
-	// =========================
-	// Lookup patient
-	// =========================
 
 	var p Patient
+	var photo sql.NullString
+	var createdAt time.Time
+
 	err := db.QueryRow(`
-		SELECT id, username, phone, created_at
+		SELECT id, username, phone, photo, created_at
 		FROM patients
 		WHERE username = $1 AND phone = $2
-	`, username, phone).Scan(
-		&p.ID,
-		&p.Username,
-		&p.Phone,
-		&p.CreatedAt,
-	)
+	`, username, phone).Scan(&p.ID, &p.Username, &p.Phone, &photo, &createdAt)
 
 	if err == sql.ErrNoRows {
-		ctx.Status(401)
-		ctx.JSON(map[string]interface{}{
-			"error": "Invalid credentials",
-		})
+		fail(ctx, 401, "Invalid credentials", nil)
+		return
+	}
+	if err != nil {
+		fail(ctx, 500, "Failed to log in", err)
 		return
 	}
 
-	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error":   "Failed to log in",
-			"details": err.Error(),
-		})
-		return
+	if photo.Valid && photo.String != "" {
+		p.Photo = &photo.String
 	}
+	p.CreatedAt = createdAt.Format(time.RFC3339)
 
 	ctx.JSON(map[string]interface{}{
 		"patient": p,
 	})
 }
 
-// ============================================================
-// Create Patient
-// ============================================================
-
 func CreatePatient(ctx *breeze.Context) {
 
 	var payload CreatePatientRequest
-
 	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error": "Invalid JSON body",
-		})
+		fail(ctx, 400, "Invalid JSON body", nil)
 		return
 	}
 
 	username := strings.TrimSpace(payload.Username)
 	phone := strings.TrimSpace(payload.Phone)
 
-	// =========================
-	// Required fields
-	// =========================
-
-	required := map[string]string{
-		"username": username,
-		"phone":    phone,
+	if username == "" {
+		fail(ctx, 400, "username is required", nil)
+		return
 	}
-
-	for field, value := range required {
-		if value == "" {
-			ctx.Status(400)
-			ctx.JSON(map[string]interface{}{
-				"error": field + " is required",
-			})
-			return
-		}
+	if phone == "" {
+		fail(ctx, 400, "phone is required", nil)
+		return
 	}
-
-	// =========================
-	// Insert
-	// =========================
-
-	query := `
-		INSERT INTO patients (
-			username,
-			phone
-		)
-		VALUES ($1, $2)
-		RETURNING id, created_at
-	`
 
 	var id int64
 	var createdAt time.Time
 
-	err := db.QueryRow(
-		query,
-		username,
-		phone,
-	).Scan(
-		&id,
-		&createdAt,
-	)
+	err := db.QueryRow(`
+		INSERT INTO patients (username, phone)
+		VALUES ($1, $2)
+		RETURNING id, created_at
+	`, username, phone).Scan(&id, &createdAt)
 
 	if err != nil {
 		if isUniqueViolation(err) {
-			ctx.Status(409)
-			ctx.JSON(map[string]interface{}{
-				"error": "Username or phone already exists",
-			})
+			fail(ctx, 409, "Username or phone already exists", nil)
 			return
 		}
-
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error":   "Failed to create patient",
-			"details": err.Error(),
-		})
+		fail(ctx, 500, "Failed to create patient", err)
 		return
 	}
 
@@ -1538,71 +1207,41 @@ func CreatePatient(ctx *breeze.Context) {
 	})
 }
 
-// ============================================================
-// Get Patients
-// ============================================================
-
 func GetPatients(ctx *breeze.Context) {
 
 	rows, err := db.Query(`
-		SELECT
-			id,
-			username,
-			phone,
-			photo,
-			created_at
+		SELECT id, username, phone, photo, created_at
 		FROM patients
 		ORDER BY created_at DESC
 	`)
-
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 500, "Failed to load patients", err)
 		return
 	}
-
 	defer rows.Close()
 
 	patients := []Patient{}
 
 	for rows.Next() {
-
 		var p Patient
 		var photo sql.NullString
 		var createdAt time.Time
 
-		err := rows.Scan(
-			&p.ID,
-			&p.Username,
-			&p.Phone,
-			&photo,
-			&createdAt,
-		)
-
-		if err != nil {
-			ctx.Status(500)
-			ctx.JSON(map[string]interface{}{
-				"error": err.Error(),
-			})
+		if err := rows.Scan(&p.ID, &p.Username, &p.Phone, &photo, &createdAt); err != nil {
+			fail(ctx, 500, "Failed to read patients", err)
 			return
 		}
 
 		if photo.Valid && photo.String != "" {
 			p.Photo = &photo.String
 		}
-
 		p.CreatedAt = createdAt.Format(time.RFC3339)
 
 		patients = append(patients, p)
 	}
 
 	if err := rows.Err(); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 500, "Failed to read patients", err)
 		return
 	}
 
@@ -1612,18 +1251,11 @@ func GetPatients(ctx *breeze.Context) {
 	})
 }
 
-// ============================================================
-// Get Patient
-// ============================================================
-
 func GetPatient(ctx *breeze.Context) {
 
 	id, err := strconv.ParseInt(ctx.Param("id"), 10, 64)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error": "Invalid patient id",
-		})
+		fail(ctx, 400, "Invalid patient id", nil)
 		return
 	}
 
@@ -1632,42 +1264,23 @@ func GetPatient(ctx *breeze.Context) {
 	var createdAt time.Time
 
 	err = db.QueryRow(`
-		SELECT
-			id,
-			username,
-			phone,
-			photo,
-			created_at
+		SELECT id, username, phone, photo, created_at
 		FROM patients
 		WHERE id = $1
-	`, id).Scan(
-		&p.ID,
-		&p.Username,
-		&p.Phone,
-		&photo,
-		&createdAt,
-	)
+	`, id).Scan(&p.ID, &p.Username, &p.Phone, &photo, &createdAt)
 
 	if err == sql.ErrNoRows {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{
-			"error": "Patient not found",
-		})
+		fail(ctx, 404, "Patient not found", nil)
 		return
 	}
-
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 500, "Failed to load patient", err)
 		return
 	}
 
 	if photo.Valid && photo.String != "" {
 		p.Photo = &photo.String
 	}
-
 	p.CreatedAt = createdAt.Format(time.RFC3339)
 
 	ctx.JSON(map[string]interface{}{
@@ -1675,101 +1288,53 @@ func GetPatient(ctx *breeze.Context) {
 	})
 }
 
-// ============================================================
-// Update Patient
-// ============================================================
-
 func UpdatePatient(ctx *breeze.Context) {
 
 	id, err := strconv.ParseInt(ctx.Param("id"), 10, 64)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error": "Invalid patient id",
-		})
+		fail(ctx, 400, "Invalid patient id", nil)
 		return
 	}
 
 	var payload UpdatePatientRequest
-
 	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error": "Invalid JSON body",
-		})
+		fail(ctx, 400, "Invalid JSON body", nil)
 		return
 	}
 
 	username := strings.TrimSpace(payload.Username)
 	phone := strings.TrimSpace(payload.Phone)
 
-	// =========================
-	// Required fields
-	// =========================
-
-	required := map[string]string{
-		"username": username,
-		"phone":    phone,
+	if username == "" {
+		fail(ctx, 400, "username is required", nil)
+		return
 	}
-
-	for field, value := range required {
-		if value == "" {
-			ctx.Status(400)
-			ctx.JSON(map[string]interface{}{
-				"error": field + " is required",
-			})
-			return
-		}
+	if phone == "" {
+		fail(ctx, 400, "phone is required", nil)
+		return
 	}
-
-	// =========================
-	// Update
-	// =========================
 
 	result, err := db.Exec(`
 		UPDATE patients
-		SET
-			username = $1,
-			phone = $2
+		SET username = $1, phone = $2
 		WHERE id = $3
-	`,
-		username,
-		phone,
-		id,
-	)
-
+	`, username, phone, id)
 	if err != nil {
 		if isUniqueViolation(err) {
-			ctx.Status(409)
-			ctx.JSON(map[string]interface{}{
-				"error": "Username or phone already exists",
-			})
+			fail(ctx, 409, "Username or phone already exists", nil)
 			return
 		}
-
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error":   "Failed to update patient",
-			"details": err.Error(),
-		})
+		fail(ctx, 500, "Failed to update patient", err)
 		return
 	}
 
 	rows, err := result.RowsAffected()
-
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 500, "Failed to update patient", err)
 		return
 	}
-
 	if rows == 0 {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{
-			"error": "Patient not found",
-		})
+		fail(ctx, 404, "Patient not found", nil)
 		return
 	}
 
@@ -1783,49 +1348,27 @@ func UpdatePatient(ctx *breeze.Context) {
 	})
 }
 
-// ============================================================
-// Delete Patient
-// ============================================================
-
 func DeletePatient(ctx *breeze.Context) {
 
 	id, err := strconv.ParseInt(ctx.Param("id"), 10, 64)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{
-			"error": "Invalid patient id",
-		})
+		fail(ctx, 400, "Invalid patient id", nil)
 		return
 	}
 
-	result, err := db.Exec(
-		"DELETE FROM patients WHERE id = $1",
-		id,
-	)
-
+	result, err := db.Exec("DELETE FROM patients WHERE id = $1", id)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 500, "Failed to delete patient", err)
 		return
 	}
 
 	rows, err := result.RowsAffected()
-
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{
-			"error": err.Error(),
-		})
+		fail(ctx, 500, "Failed to delete patient", err)
 		return
 	}
-
 	if rows == 0 {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{
-			"error": "Patient not found",
-		})
+		fail(ctx, 404, "Patient not found", nil)
 		return
 	}
 
@@ -1835,20 +1378,17 @@ func DeletePatient(ctx *breeze.Context) {
 }
 
 // ============================================================
-// Chat
+// Chat — Types
 // ============================================================
 
 type Conversation struct {
-	ID        string            `json:"id"`
-	PatientID int64             `json:"patient_id"`
-	DoctorID  string            `json:"doctor_id"`
-	CreatedAt string            `json:"created_at"`
-	UpdatedAt string            `json:"updated_at"`
-	// FirstMessage is the JSON payload of the *first* message posted in this
-	// conversation. It is NULL until someone posts one (usually a profile
-	// picture through POST /doctors/:id/chat-image or /patients/:id/chat-image).
-	// A pointer to json.RawMessage keeps the value opaquely as raw JSON so it
-	// can be re-emitted without re-marshalling an empty object.
+	ID        string `json:"id"`
+	PatientID int64  `json:"patient_id"`
+	DoctorID  string `json:"doctor_id"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+	// FirstMessage is the JSON payload {"image": "<data URL>"} of the opening
+	// picture. NULL until a profile picture exists.
 	FirstMessage *json.RawMessage `json:"first_message,omitempty"`
 }
 
@@ -1880,8 +1420,6 @@ type ChatWSRequest struct {
 	SenderID       string `json:"sender_id"`
 	Message        string `json:"message"`
 	// Optional base64 data URL (e.g. "data:image/jpeg;base64,...").
-	// When present, the message is stored with image_data instead of a
-	// plain-text body; the text field may still carry a caption.
 	Image string `json:"image,omitempty"`
 }
 
@@ -1891,69 +1429,79 @@ type ChatWSEvent struct {
 	Error   string      `json:"error,omitempty"`
 }
 
+// firstMessageJSON builds the JSONB payload for conversations.first_message.
+// It returns a *string* on purpose: lib/pq sends []byte as bytea, which
+// Postgres rejects for a JSONB column ("invalid input syntax for type json").
+func firstMessageJSON(dataURL string) (string, error) {
+	b, err := json.Marshal(map[string]string{"image": dataURL})
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// ============================================================
+// Chat — Conversations
+// ============================================================
+
 func CreateConversation(ctx *breeze.Context) {
+
 	var payload CreateConversationRequest
 	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "Invalid JSON body"})
+		fail(ctx, 400, "Invalid JSON body", nil)
 		return
 	}
 
-	if payload.PatientID <= 0 || strings.TrimSpace(payload.DoctorID) == "" {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "patient_id and doctor_id are required"})
+	payload.DoctorID = strings.TrimSpace(payload.DoctorID)
+
+	if payload.PatientID <= 0 || payload.DoctorID == "" {
+		fail(ctx, 400, "patient_id and doctor_id are required", nil)
+		return
+	}
+	if !isValidUUID(payload.DoctorID) {
+		fail(ctx, 400, "Invalid doctor_id", nil)
 		return
 	}
 
-	// Validate both participants before creating the conversation.
 	var patientExists bool
 	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM patients WHERE id = $1)`, payload.PatientID).Scan(&patientExists); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to validate patient", "details": err.Error()})
+		fail(ctx, 500, "Failed to validate patient", err)
 		return
 	}
 	if !patientExists {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{"error": "Patient not found"})
+		fail(ctx, 404, "Patient not found", nil)
 		return
 	}
 
-	var doctorExists bool
-	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM doctors WHERE id = $1)`, payload.DoctorID).Scan(&doctorExists); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to validate doctor", "details": err.Error()})
-		return
-	}
-	if !doctorExists {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{"error": "Doctor not found"})
-		return
-	}
-
-	// Carry the doctor's stored profile picture into the conversation's
-	// first_message column so the peer can render the opening image even
-	// before any real message is sent. The column is JSONB; we store a JSON
-	// object {"image": "<data URL>"}, or NULL when the doctor has none.
-	// COALESCE in the ON CONFLICT branch keeps any existing first_message
-	// intact on re-opens.
+	// Load the doctor's photo; sql.ErrNoRows means the doctor does not exist.
 	var doctorPhoto sql.NullString
-	if err := db.QueryRow(`SELECT profile_image FROM doctors WHERE id = $1`, payload.DoctorID).Scan(&doctorPhoto); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to load doctor photo", "details": err.Error()})
+	err := db.QueryRow(`SELECT profile_image FROM doctors WHERE id = $1`, payload.DoctorID).Scan(&doctorPhoto)
+	if err == sql.ErrNoRows {
+		fail(ctx, 404, "Doctor not found", nil)
+		return
+	}
+	if err != nil {
+		fail(ctx, 500, "Failed to load doctor", err)
 		return
 	}
 
+	// nil => SQL NULL. A string => cast by Postgres to jsonb.
 	var firstMessage interface{}
 	if doctorPhoto.Valid && strings.TrimSpace(doctorPhoto.String) != "" {
-		dataURL := doctorPhoto.String
-		firstMessage, _ = json.Marshal(map[string]string{"image": dataURL})
+		fm, err := firstMessageJSON(doctorPhoto.String)
+		if err != nil {
+			fail(ctx, 500, "Failed to encode first message", err)
+			return
+		}
+		firstMessage = fm
 	}
 
 	var c Conversation
 	var createdAt, updatedAt time.Time
-	err := db.QueryRow(`
+
+	err = db.QueryRow(`
 		INSERT INTO conversations (patient_id, doctor_id, first_message)
-		VALUES ($1, $2, $3)
+		VALUES ($1, $2, $3::jsonb)
 		ON CONFLICT (patient_id, doctor_id)
 		DO UPDATE SET
 			updated_at = conversations.updated_at,
@@ -1963,18 +1511,19 @@ func CreateConversation(ctx *breeze.Context) {
 		&c.ID, &c.PatientID, &c.DoctorID, &createdAt, &updatedAt,
 	)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to create conversation", "details": err.Error()})
+		fail(ctx, 500, "Failed to create conversation", err)
 		return
 	}
 
 	c.CreatedAt = createdAt.Format(time.RFC3339)
 	c.UpdatedAt = updatedAt.Format(time.RFC3339)
+
 	ctx.Status(201)
 	ctx.JSON(map[string]interface{}{"conversation": c})
 }
 
 func GetConversations(ctx *breeze.Context) {
+
 	patientID := strings.TrimSpace(ctx.Query("patient_id"))
 	doctorID := strings.TrimSpace(ctx.Query("doctor_id"))
 
@@ -1988,14 +1537,17 @@ func GetConversations(ctx *breeze.Context) {
 	if patientID != "" {
 		id, err := strconv.ParseInt(patientID, 10, 64)
 		if err != nil {
-			ctx.Status(400)
-			ctx.JSON(map[string]interface{}{"error": "Invalid patient_id"})
+			fail(ctx, 400, "Invalid patient_id", nil)
 			return
 		}
 		args = append(args, id)
 		where = append(where, fmt.Sprintf("patient_id = $%d", len(args)))
 	}
 	if doctorID != "" {
+		if !isValidUUID(doctorID) {
+			fail(ctx, 400, "Invalid doctor_id", nil)
+			return
+		}
 		args = append(args, doctorID)
 		where = append(where, fmt.Sprintf("doctor_id = $%d", len(args)))
 	}
@@ -2006,8 +1558,7 @@ func GetConversations(ctx *breeze.Context) {
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 500, "Failed to load conversations", err)
 		return
 	}
 	defer rows.Close()
@@ -2017,11 +1568,12 @@ func GetConversations(ctx *breeze.Context) {
 		var c Conversation
 		var firstMessage []byte
 		var createdAt, updatedAt time.Time
+
 		if err := rows.Scan(&c.ID, &c.PatientID, &c.DoctorID, &firstMessage, &createdAt, &updatedAt); err != nil {
-			ctx.Status(500)
-			ctx.JSON(map[string]interface{}{"error": err.Error()})
+			fail(ctx, 500, "Failed to read conversations", err)
 			return
 		}
+
 		c.CreatedAt = createdAt.Format(time.RFC3339)
 		c.UpdatedAt = updatedAt.Format(time.RFC3339)
 		if len(firstMessage) > 0 {
@@ -2031,10 +1583,21 @@ func GetConversations(ctx *breeze.Context) {
 		conversations = append(conversations, c)
 	}
 
+	if err := rows.Err(); err != nil {
+		fail(ctx, 500, "Failed to read conversations", err)
+		return
+	}
+
 	ctx.JSON(map[string]interface{}{"count": len(conversations), "conversations": conversations})
 }
 
 func conversationExistsForSender(conversationID, senderType, senderID string) (bool, error) {
+
+	// A malformed UUID would make Postgres error out; treat it as "not a member".
+	if !isValidUUID(conversationID) {
+		return false, nil
+	}
+
 	switch senderType {
 	case "patient":
 		id, err := strconv.ParseInt(senderID, 10, 64)
@@ -2045,6 +1608,9 @@ func conversationExistsForSender(conversationID, senderType, senderID string) (b
 		err = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1 AND patient_id = $2)`, conversationID, id).Scan(&ok)
 		return ok, err
 	case "doctor":
+		if !isValidUUID(senderID) {
+			return false, nil
+		}
 		var ok bool
 		err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1 AND doctor_id = $2)`, conversationID, senderID).Scan(&ok)
 		return ok, err
@@ -2053,11 +1619,15 @@ func conversationExistsForSender(conversationID, senderType, senderID string) (b
 	}
 }
 
+// ============================================================
+// Chat — Messages
+// ============================================================
+
 func GetMessages(ctx *breeze.Context) {
+
 	conversationID := ctx.Param("id")
-	if conversationID == "" {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "conversation id is required"})
+	if conversationID == "" || !isValidUUID(conversationID) {
+		fail(ctx, 400, "valid conversation id is required", nil)
 		return
 	}
 
@@ -2068,8 +1638,7 @@ func GetMessages(ctx *breeze.Context) {
 		ORDER BY created_at ASC, id ASC
 	`, conversationID)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 500, "Failed to load messages", err)
 		return
 	}
 	defer rows.Close()
@@ -2079,9 +1648,9 @@ func GetMessages(ctx *breeze.Context) {
 		var m Message
 		var msg, image sql.NullString
 		var createdAt time.Time
+
 		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderType, &m.SenderID, &msg, &image, &createdAt); err != nil {
-			ctx.Status(500)
-			ctx.JSON(map[string]interface{}{"error": err.Error()})
+			fail(ctx, 500, "Failed to read messages", err)
 			return
 		}
 		if msg.Valid {
@@ -2094,10 +1663,16 @@ func GetMessages(ctx *breeze.Context) {
 		messages = append(messages, m)
 	}
 
+	if err := rows.Err(); err != nil {
+		fail(ctx, 500, "Failed to read messages", err)
+		return
+	}
+
 	ctx.JSON(map[string]interface{}{"count": len(messages), "messages": messages})
 }
 
 func insertMessage(conversationID, senderType, senderID, message string, imageData *string) (Message, error) {
+
 	var m Message
 	var msg, image sql.NullString
 	var createdAt time.Time
@@ -2120,8 +1695,8 @@ func insertMessage(conversationID, senderType, senderID, message string, imageDa
 	}
 	m.CreatedAt = createdAt.Format(time.RFC3339)
 
-	// Bump the conversation so it sorts first. A failure here must not fail the
-	// send, but it should never be silent either.
+	// Bump the conversation so it sorts first. A failure here must not fail
+	// the send, but it should never be silent either.
 	if _, err := db.Exec(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, conversationID); err != nil {
 		log.Println("failed to touch conversation:", err)
 	}
@@ -2129,39 +1704,37 @@ func insertMessage(conversationID, senderType, senderID, message string, imageDa
 }
 
 func SendMessage(ctx *breeze.Context) {
+
 	conversationID := ctx.Param("id")
+
 	var payload SendMessageRequest
 	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "Invalid JSON body"})
+		fail(ctx, 400, "Invalid JSON body", nil)
 		return
 	}
 
 	payload.SenderType = strings.TrimSpace(strings.ToLower(payload.SenderType))
 	payload.SenderID = strings.TrimSpace(payload.SenderID)
 	payload.Message = strings.TrimSpace(payload.Message)
+
 	if payload.SenderType == "" || payload.SenderID == "" || payload.Message == "" {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "sender_type, sender_id and message are required"})
+		fail(ctx, 400, "sender_type, sender_id and message are required", nil)
 		return
 	}
 
 	ok, err := conversationExistsForSender(conversationID, payload.SenderType, payload.SenderID)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 500, "Failed to validate conversation", err)
 		return
 	}
 	if !ok {
-		ctx.Status(403)
-		ctx.JSON(map[string]interface{}{"error": "Sender is not a member of this conversation"})
+		fail(ctx, 403, "Sender is not a member of this conversation", nil)
 		return
 	}
 
 	m, err := insertMessage(conversationID, payload.SenderType, payload.SenderID, payload.Message, nil)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to save message", "details": err.Error()})
+		fail(ctx, 500, "Failed to save message", err)
 		return
 	}
 
@@ -2171,11 +1744,12 @@ func SendMessage(ctx *breeze.Context) {
 }
 
 func SendImageMessage(ctx *breeze.Context) {
+
 	conversationID := ctx.Param("id")
+
 	files, fields, err := ctx.ParseMultipart(MaxFileSize)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "Invalid multipart form", "details": err.Error()})
+		fail(ctx, 400, "Invalid multipart form", err)
 		return
 	}
 
@@ -2185,40 +1759,36 @@ func SendImageMessage(ctx *breeze.Context) {
 		}
 		return ""
 	}
+
 	senderType := strings.ToLower(field("sender_type"))
 	senderID := field("sender_id")
 	message := field("message")
+
 	if senderType == "" || senderID == "" {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "sender_type and sender_id are required"})
+		fail(ctx, 400, "sender_type and sender_id are required", nil)
 		return
 	}
 
 	ok, err := conversationExistsForSender(conversationID, senderType, senderID)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 500, "Failed to validate conversation", err)
 		return
 	}
 	if !ok {
-		ctx.Status(403)
-		ctx.JSON(map[string]interface{}{"error": "Sender is not a member of this conversation"})
+		fail(ctx, 403, "Sender is not a member of this conversation", nil)
 		return
 	}
 
-	imageData, err := readUploadedFile(files, "image", MaxImageSize, []string{
-		"image/jpeg", "image/png", "image/webp",
-	}, true)
+	imageData, err := readUploadedFile(files, "image", MaxImageSize,
+		[]string{"image/jpeg", "image/png", "image/webp"}, true)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 400, err.Error(), nil)
 		return
 	}
 
 	m, err := insertMessage(conversationID, senderType, senderID, message, imageData)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to save image message", "details": err.Error()})
+		fail(ctx, 500, "Failed to save image message", err)
 		return
 	}
 
@@ -2235,71 +1805,59 @@ func SendImageMessage(ctx *breeze.Context) {
 //
 // The doctor uploads a picture (multipart field "image", 5 MB max, JPEG/PNG/
 // WebP). It is persisted as:
-//   1. The doctor's profile_image column (so the patient side can render it
-//      in the chat header), and
-//   2. The doctor's *next* conversation row's first_message column, so the
-//      patient sees the opening image even before a real message is sent.
+//  1. the doctor's profile_image column, and
+//  2. first_message on all of the doctor's existing conversations.
 //
-// If the doctor has no conversation yet, only the profile_image is stored and
-// the first_message is written the next time CreateConversation runs.
+// If the doctor has no conversation yet, first_message is written the next
+// time CreateConversation runs.
 func SaveDoctorChatImage(ctx *breeze.Context) {
+
 	doctorID := ctx.Param("id")
-	if doctorID == "" {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "doctor id is required"})
+	if !isValidUUID(doctorID) {
+		fail(ctx, 400, "Invalid doctor id", nil)
 		return
 	}
 
 	files, _, err := ctx.ParseMultipart(MaxImageSize)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "Invalid multipart form", "details": err.Error()})
+		fail(ctx, 400, "Invalid multipart form", err)
 		return
 	}
 
-	imageData, err := readUploadedFile(files, "image", MaxImageSize, []string{
-		"image/jpeg", "image/png", "image/webp",
-	}, true)
+	imageData, err := readUploadedFile(files, "image", MaxImageSize,
+		[]string{"image/jpeg", "image/png", "image/webp"}, true)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 400, err.Error(), nil)
 		return
 	}
 
-	// Verify the doctor exists and load the photo for first_message.
-	var exists bool
-	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM doctors WHERE id = $1)`, doctorID).Scan(&exists); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
-		return
-	}
-	if !exists {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{"error": "Doctor not found"})
-		return
-	}
-
-	// Persist the picture on the doctor row so the patient dashboard can
-	// render it in the chat header.
-	if _, err := db.Exec(`
+	result, err := db.Exec(`
 		UPDATE doctors
 		SET profile_image = $1, updated_at = NOW()
 		WHERE id = $2
-	`, imageData, doctorID); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to save doctor image", "details": err.Error()})
+	`, imageData, doctorID)
+	if err != nil {
+		fail(ctx, 500, "Failed to save doctor image", err)
+		return
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		fail(ctx, 404, "Doctor not found", nil)
 		return
 	}
 
-	// Upsert the doctor's first_message on any existing conversation. The
-	// first_message column is JSONB, so we store a JSON object
-	// {"image": "<data URL>"} — NULL when there is no conversation yet.
-	firstMessage, _ := json.Marshal(map[string]string{"image": *imageData})
-	_, _ = db.Exec(`
+	// first_message is JSONB: pass a string, never []byte (see firstMessageJSON).
+	fm, err := firstMessageJSON(*imageData)
+	if err != nil {
+		fail(ctx, 500, "Failed to encode first message", err)
+		return
+	}
+	if _, err := db.Exec(`
 		UPDATE conversations
-		SET first_message = $1, updated_at = NOW()
+		SET first_message = $1::jsonb, updated_at = NOW()
 		WHERE doctor_id = $2
-	`, firstMessage, doctorID)
+	`, fm, doctorID); err != nil {
+		log.Println("failed to update first_message for doctor:", err)
+	}
 
 	ctx.JSON(map[string]interface{}{
 		"message": "Doctor image saved",
@@ -2312,81 +1870,63 @@ func SaveDoctorChatImage(ctx *breeze.Context) {
 // ============================================================
 
 // SavePatientChatImage handles POST /patients/:id/chat-image.
-//
-// The patient uploads a picture (multipart field "image", 5 MB max,
-// JPEG/PNG/WebP). It is persisted as:
-//   1. The patient's photo column (so the doctor side can render it in the
-//      chat header), and
-//   2. The patient's *next* conversation row's first_message column, so the
-//      doctor sees the opening image even before a real message is sent.
-//
-// If the patient has no conversation yet, only the photo is stored and the
-// first_message is written the next time CreateConversation runs.
+// Same flow as SaveDoctorChatImage, using patients.photo.
 func SavePatientChatImage(ctx *breeze.Context) {
-	patientIDStr := ctx.Param("id")
-	patientID, err := strconv.ParseInt(patientIDStr, 10, 64)
+
+	patientID, err := strconv.ParseInt(ctx.Param("id"), 10, 64)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "Invalid patient id"})
+		fail(ctx, 400, "Invalid patient id", nil)
 		return
 	}
 
 	files, _, err := ctx.ParseMultipart(MaxImageSize)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "Invalid multipart form", "details": err.Error()})
+		fail(ctx, 400, "Invalid multipart form", err)
 		return
 	}
 
-	imageData, err := readUploadedFile(files, "image", MaxImageSize, []string{
-		"image/jpeg", "image/png", "image/webp",
-	}, true)
+	imageData, err := readUploadedFile(files, "image", MaxImageSize,
+		[]string{"image/jpeg", "image/png", "image/webp"}, true)
 	if err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 400, err.Error(), nil)
 		return
 	}
 
-	// Verify the patient exists.
-	var exists bool
-	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM patients WHERE id = $1)`, patientID).Scan(&exists); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+	result, err := db.Exec(`UPDATE patients SET photo = $1 WHERE id = $2`, imageData, patientID)
+	if err != nil {
+		fail(ctx, 500, "Failed to save patient image", err)
 		return
 	}
-	if !exists {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{"error": "Patient not found"})
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		fail(ctx, 404, "Patient not found", nil)
 		return
 	}
 
-	// Persist the picture on the patient row so the doctor dashboard can
-	// render it in the chat header.
+	fm, err := firstMessageJSON(*imageData)
+	if err != nil {
+		fail(ctx, 500, "Failed to encode first message", err)
+		return
+	}
 	if _, err := db.Exec(`
-		UPDATE patients SET photo = $1 WHERE id = $2
-	`, imageData, patientID); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to save patient image", "details": err.Error()})
-		return
-	}
-
-	// Upsert the patient's first_message on any existing conversation. The
-	// first_message column is JSONB, so we store a JSON object
-	// {"image": "<data URL>"} — NULL when there is no conversation yet.
-	firstMessage, _ := json.Marshal(map[string]string{"image": *imageData})
-	_, _ = db.Exec(`
 		UPDATE conversations
-		SET first_message = $1, updated_at = NOW()
+		SET first_message = $1::jsonb, updated_at = NOW()
 		WHERE patient_id = $2
-	`, firstMessage, patientID)
+	`, fm, patientID); err != nil {
+		log.Println("failed to update first_message for patient:", err)
+	}
 
 	ctx.JSON(map[string]interface{}{
-		"message":  "Patient image saved",
-		"patient":  map[string]interface{}{"id": patientID, "image": *imageData},
+		"message": "Patient image saved",
+		"patient": map[string]interface{}{"id": patientID, "image": *imageData},
 	})
 }
 
+// ============================================================
+// Chat — WebSocket
+// ============================================================
+
 func broadcastChatMessage(m Message) {
+
 	payload, err := json.Marshal(ChatWSEvent{Type: "message.created", Message: m})
 	if err != nil {
 		return
@@ -2420,6 +1960,7 @@ func chatWSOnClose(conn *breeze.WSConn, code uint16, reason string) {
 }
 
 func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
+
 	if opcode != 1 { // text frames only for the JSON chat protocol
 		return
 	}
@@ -2436,6 +1977,7 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 	req.SenderID = strings.TrimSpace(req.SenderID)
 
 	switch req.Type {
+
 	case "subscribe":
 		if req.ConversationID == "" || req.SenderType == "" || req.SenderID == "" {
 			_ = conn.SendText(`{"type":"error","error":"conversation_id, sender_type and sender_id are required"}`)
@@ -2459,6 +2001,7 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 		chatWS.RLock()
 		subscribedConversation := chatWS.clients[conn]
 		chatWS.RUnlock()
+
 		if subscribedConversation == "" || subscribedConversation != req.ConversationID {
 			_ = conn.SendText(`{"type":"error","error":"Subscribe to the conversation first"}`)
 			return
@@ -2467,7 +2010,7 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 			_ = conn.SendText(`{"type":"error","error":"sender_type and sender_id are required"}`)
 			return
 		}
-		if strings.TrimSpace(req.Message) == "" && req.Image == "" {
+		if strings.TrimSpace(req.Message) == "" && strings.TrimSpace(req.Image) == "" {
 			_ = conn.SendText(`{"type":"error","error":"message or image is required"}`)
 			return
 		}
@@ -2476,13 +2019,16 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 			_ = conn.SendText(`{"type":"error","error":"Sender is not a member of this conversation"}`)
 			return
 		}
+
 		var imgPtr *string
 		if strings.TrimSpace(req.Image) != "" {
 			v := req.Image
 			imgPtr = &v
 		}
+
 		m, err := insertMessage(req.ConversationID, req.SenderType, req.SenderID, req.Message, imgPtr)
 		if err != nil {
+			log.Println("ws insertMessage error:", err)
 			_ = conn.SendText(`{"type":"error","error":"Failed to save message"}`)
 			return
 		}
@@ -2497,13 +2043,12 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 // Work Places — CRUD
 // ============================================================
 
-// CreateWorkPlace handles POST /work-places.
-// Body: CreateWorkPlaceRequest (JSON). Schedules are optional.
+// CreateWorkPlace handles POST /work-places. Schedules are optional.
 func CreateWorkPlace(ctx *breeze.Context) {
+
 	var payload CreateWorkPlaceRequest
 	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "Invalid JSON body"})
+		fail(ctx, 400, "Invalid JSON body", nil)
 		return
 	}
 
@@ -2521,31 +2066,30 @@ func CreateWorkPlace(ctx *breeze.Context) {
 	}
 	for field, val := range required {
 		if val == "" {
-			ctx.Status(400)
-			ctx.JSON(map[string]interface{}{"error": field + " is required"})
+			fail(ctx, 400, field+" is required", nil)
 			return
 		}
 	}
+	if !isValidUUID(payload.DoctorID) {
+		fail(ctx, 400, "Invalid doctor_id", nil)
+		return
+	}
 
-	// Verify doctor exists
 	var doctorExists bool
 	if err := db.QueryRow(
 		`SELECT EXISTS(SELECT 1 FROM doctors WHERE id = $1)`, payload.DoctorID,
 	).Scan(&doctorExists); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to validate doctor", "details": err.Error()})
+		fail(ctx, 500, "Failed to validate doctor", err)
 		return
 	}
 	if !doctorExists {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{"error": "Doctor not found"})
+		fail(ctx, 404, "Doctor not found", nil)
 		return
 	}
 
 	tx, err := db.Begin()
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to start transaction", "details": err.Error()})
+		fail(ctx, 500, "Failed to start transaction", err)
 		return
 	}
 	defer tx.Rollback()
@@ -2567,8 +2111,7 @@ func CreateWorkPlace(ctx *breeze.Context) {
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to create work place", "details": err.Error()})
+		fail(ctx, 500, "Failed to create work place", err)
 		return
 	}
 	scanNullableString(nsPhone, &wp.Phone)
@@ -2576,18 +2119,15 @@ func CreateWorkPlace(ctx *breeze.Context) {
 	wp.CreatedAt = createdAt.Format(time.RFC3339)
 	wp.UpdatedAt = updatedAt.Format(time.RFC3339)
 
-	// Insert schedules if provided
 	if len(payload.Schedules) > 0 {
 		if err := insertSchedules(tx, wp.ID, payload.Schedules); err != nil {
-			ctx.Status(400)
-			ctx.JSON(map[string]interface{}{"error": err.Error()})
+			fail(ctx, 400, err.Error(), nil)
 			return
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to commit transaction", "details": err.Error()})
+		fail(ctx, 500, "Failed to commit transaction", err)
 		return
 	}
 
@@ -2599,6 +2139,7 @@ func CreateWorkPlace(ctx *breeze.Context) {
 
 // GetWorkPlaces handles GET /work-places?doctor_id=...
 func GetWorkPlaces(ctx *breeze.Context) {
+
 	doctorID := strings.TrimSpace(ctx.Query("doctor_id"))
 
 	query := `
@@ -2607,6 +2148,10 @@ func GetWorkPlaces(ctx *breeze.Context) {
 	`
 	args := []interface{}{}
 	if doctorID != "" {
+		if !isValidUUID(doctorID) {
+			fail(ctx, 400, "Invalid doctor_id", nil)
+			return
+		}
 		query += " WHERE doctor_id = $1"
 		args = append(args, doctorID)
 	}
@@ -2614,8 +2159,7 @@ func GetWorkPlaces(ctx *breeze.Context) {
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 500, "Failed to load work places", err)
 		return
 	}
 	defer rows.Close()
@@ -2626,13 +2170,13 @@ func GetWorkPlaces(ctx *breeze.Context) {
 		var nsP sql.NullString
 		var nfP sql.NullFloat64
 		var createdAt, updatedAt time.Time
+
 		if err := rows.Scan(
 			&wp.ID, &wp.DoctorID, &wp.PlaceType, &wp.Name, &wp.Address,
 			&nsP, &nfP,
 			&createdAt, &updatedAt,
 		); err != nil {
-			ctx.Status(500)
-			ctx.JSON(map[string]interface{}{"error": err.Error()})
+			fail(ctx, 500, "Failed to read work places", err)
 			return
 		}
 		scanNullableString(nsP, &wp.Phone)
@@ -2643,12 +2187,22 @@ func GetWorkPlaces(ctx *breeze.Context) {
 		places = append(places, wp)
 	}
 
+	if err := rows.Err(); err != nil {
+		fail(ctx, 500, "Failed to read work places", err)
+		return
+	}
+
 	ctx.JSON(map[string]interface{}{"count": len(places), "work_places": places})
 }
 
 // GetWorkPlace handles GET /work-places/:id
 func GetWorkPlace(ctx *breeze.Context) {
+
 	id := ctx.Param("id")
+	if !isValidUUID(id) {
+		fail(ctx, 400, "Invalid work place id", nil)
+		return
+	}
 
 	var wp WorkPlace
 	var nsP sql.NullString
@@ -2665,15 +2219,14 @@ func GetWorkPlace(ctx *breeze.Context) {
 		&createdAt, &updatedAt,
 	)
 	if err == sql.ErrNoRows {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{"error": "Work place not found"})
+		fail(ctx, 404, "Work place not found", nil)
 		return
 	}
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 500, "Failed to load work place", err)
 		return
 	}
+
 	scanNullableString(nsP, &wp.Phone)
 	scanNullableFloat(nfP, &wp.ExamPrice)
 	wp.CreatedAt = createdAt.Format(time.RFC3339)
@@ -2685,12 +2238,16 @@ func GetWorkPlace(ctx *breeze.Context) {
 
 // UpdateWorkPlace handles PUT /work-places/:id
 func UpdateWorkPlace(ctx *breeze.Context) {
+
 	id := ctx.Param("id")
+	if !isValidUUID(id) {
+		fail(ctx, 400, "Invalid work place id", nil)
+		return
+	}
 
 	var payload UpdateWorkPlaceRequest
 	if err := json.Unmarshal(ctx.Req.Body, &payload); err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "Invalid JSON body"})
+		fail(ctx, 400, "Invalid JSON body", nil)
 		return
 	}
 
@@ -2706,8 +2263,7 @@ func UpdateWorkPlace(ctx *breeze.Context) {
 	}
 	for field, val := range required {
 		if val == "" {
-			ctx.Status(400)
-			ctx.JSON(map[string]interface{}{"error": field + " is required"})
+			fail(ctx, 400, field+" is required", nil)
 			return
 		}
 	}
@@ -2723,17 +2279,13 @@ func UpdateWorkPlace(ctx *breeze.Context) {
 			updated_at = NOW()
 		WHERE id = $6
 	`, payload.PlaceType, payload.Name, payload.Address, payload.Phone, payload.ExamPrice, id)
-
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to update work place", "details": err.Error()})
+		fail(ctx, 500, "Failed to update work place", err)
 		return
 	}
 
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{"error": "Work place not found"})
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		fail(ctx, 404, "Work place not found", nil)
 		return
 	}
 
@@ -2742,20 +2294,23 @@ func UpdateWorkPlace(ctx *breeze.Context) {
 
 // DeleteWorkPlace handles DELETE /work-places/:id
 func DeleteWorkPlace(ctx *breeze.Context) {
+
 	id := ctx.Param("id")
+	if !isValidUUID(id) {
+		fail(ctx, 400, "Invalid work place id", nil)
+		return
+	}
 
 	result, err := db.Exec(`DELETE FROM work_places WHERE id = $1`, id)
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 500, "Failed to delete work place", err)
 		return
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{"error": "Work place not found"})
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		fail(ctx, 404, "Work place not found", nil)
 		return
 	}
+
 	ctx.JSON(map[string]interface{}{"message": "Work place deleted successfully"})
 }
 
@@ -2764,61 +2319,57 @@ func DeleteWorkPlace(ctx *breeze.Context) {
 // ============================================================
 
 // SetWorkSchedules handles POST /work-places/:id/schedules.
-// It replaces ALL schedules for the given work place with the new ones.
+// It replaces ALL schedules for the work place.
 // Body: { "schedules": [ WorkScheduleInput, ... ] }
 func SetWorkSchedules(ctx *breeze.Context) {
+
 	workPlaceID := ctx.Param("id")
+	if !isValidUUID(workPlaceID) {
+		fail(ctx, 400, "Invalid work place id", nil)
+		return
+	}
 
 	var body struct {
 		Schedules []WorkScheduleInput `json:"schedules"`
 	}
 	if err := json.Unmarshal(ctx.Req.Body, &body); err != nil {
-		ctx.Status(400)
-		ctx.JSON(map[string]interface{}{"error": "Invalid JSON body"})
+		fail(ctx, 400, "Invalid JSON body", nil)
 		return
 	}
 
-	// Verify place exists
 	var exists bool
 	if err := db.QueryRow(
 		`SELECT EXISTS(SELECT 1 FROM work_places WHERE id = $1)`, workPlaceID,
 	).Scan(&exists); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": err.Error()})
+		fail(ctx, 500, "Failed to validate work place", err)
 		return
 	}
 	if !exists {
-		ctx.Status(404)
-		ctx.JSON(map[string]interface{}{"error": "Work place not found"})
+		fail(ctx, 404, "Work place not found", nil)
 		return
 	}
 
 	tx, err := db.Begin()
 	if err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to start transaction", "details": err.Error()})
+		fail(ctx, 500, "Failed to start transaction", err)
 		return
 	}
 	defer tx.Rollback()
 
-	// Delete old schedules
 	if _, err := tx.Exec(`DELETE FROM work_schedules WHERE work_place_id = $1`, workPlaceID); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to clear schedules", "details": err.Error()})
+		fail(ctx, 500, "Failed to clear schedules", err)
 		return
 	}
 
 	if len(body.Schedules) > 0 {
 		if err := insertSchedules(tx, workPlaceID, body.Schedules); err != nil {
-			ctx.Status(400)
-			ctx.JSON(map[string]interface{}{"error": err.Error()})
+			fail(ctx, 400, err.Error(), nil)
 			return
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		ctx.Status(500)
-		ctx.JSON(map[string]interface{}{"error": "Failed to commit transaction", "details": err.Error()})
+		fail(ctx, 500, "Failed to commit transaction", err)
 		return
 	}
 
@@ -2848,7 +2399,6 @@ func insertSchedules(tx *sql.Tx, workPlaceID string, schedules []WorkScheduleInp
 			}
 			continue
 		}
-		// Validate time strings
 		if !isValidTime(s.FromTime) || !isValidTime(s.ToTime) {
 			return fmt.Errorf("schedules[%d]: from_time and to_time must be HH:MM", i)
 		}
@@ -2866,8 +2416,8 @@ func insertSchedules(tx *sql.Tx, workPlaceID string, schedules []WorkScheduleInp
 	return nil
 }
 
-// loadSchedules fetches all schedule rows for a work place and groups
-// them as-is, preserving multiple periods per day.
+// loadSchedules fetches all schedule rows for a work place, preserving
+// multiple periods per day.
 func loadSchedules(workPlaceID string) []WorkSchedule {
 	rows, err := db.Query(`
 		SELECT id, work_place_id, day_of_week, is_off,
@@ -2914,15 +2464,6 @@ func isValidTime(s string) bool {
 	return err == nil
 }
 
-// trimSeconds truncates a time string returned by PostgreSQL ("HH:MM:SS" or
-// "HH:MM:SS.ffffff") down to "HH:MM" so it matches what the UI expects.
-func trimSeconds(s string) string {
-	if len(s) >= 5 {
-		return s[:5]
-	}
-	return s
-}
-
 // scanNullableString copies a scanned NullString into an optional pointer.
 func scanNullableString(ns sql.NullString, p **string) {
 	if ns.Valid {
@@ -2943,6 +2484,10 @@ func scanNullableFloat(nf sql.NullFloat64, p **float64) {
 // File Upload Helper
 // ============================================================
 
+// readUploadedFile validates an uploaded file and returns it as a base64 data URL.
+// The type is detected from the file's actual bytes, NOT from the client's
+// Content-Type header: proxies (such as a SvelteKit route) often send
+// "application/octet-stream", which would otherwise be rejected.
 func readUploadedFile(
 	files map[string][]*breeze.UploadedFile,
 	fieldName string,
@@ -2950,6 +2495,7 @@ func readUploadedFile(
 	allowedTypes []string,
 	required bool,
 ) (*string, error) {
+
 	items := files[fieldName]
 	if len(items) == 0 {
 		if !required {
@@ -2967,10 +2513,7 @@ func readUploadedFile(
 		return nil, fmt.Errorf("%s is empty or could not be read", fieldName)
 	}
 
-	contentType := file.ContentType
-	if contentType == "" {
-		contentType = httpDetectContentType(file.Content)
-	}
+	contentType := httpDetectContentType(file.Content)
 
 	valid := false
 	for _, allowed := range allowedTypes {
@@ -2979,7 +2522,6 @@ func readUploadedFile(
 			break
 		}
 	}
-
 	if !valid {
 		return nil, fmt.Errorf("invalid file type for %s: %s", fieldName, contentType)
 	}
@@ -2997,22 +2539,9 @@ func httpDetectContentType(data []byte) string {
 // Database Error Helper
 // ============================================================
 
-// isUniqueViolation reports whether err is a Postgres 23505 (unique_violation),
-// which the patients table raises when a username or phone is already taken.
-// Both columns are UNIQUE, so the create and update paths need to tell that
-// case apart from a genuine failure to return 409 instead of 500.
+// isUniqueViolation reports whether err is a Postgres 23505 (unique_violation)
+// so create/update paths can return 409 instead of 500.
 func isUniqueViolation(err error) bool {
 	var pqErr *pq.Error
 	return errors.As(err, &pqErr) && pqErr.Code == "23505"
-}
-
-// ============================================================
-// JSON Helper
-// ============================================================
-
-func jsonResponse(v interface{}) []byte {
-
-	data, _ := json.Marshal(v)
-
-	return data
 }
