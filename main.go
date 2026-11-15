@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -8,12 +9,16 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -52,13 +57,494 @@ func isValidUUID(s string) bool {
 }
 
 // fail writes a JSON error with the right HTTP status.
+// Every 5xx is also reported to the circuit breaker (see protect()).
 func fail(ctx *breeze.Context, status int, msg string, err error) {
+	if status >= 500 {
+		markFailed(ctx)
+	}
 	ctx.Status(status)
 	body := map[string]interface{}{"error": msg}
 	if err != nil {
 		body["details"] = err.Error()
 	}
 	ctx.JSON(body)
+}
+
+// ============================================================
+// Resilience: globals
+// ============================================================
+
+var (
+	// bgCtx stops background goroutines (limiter cleanup) on shutdown.
+	bgCtx, bgCancel = context.WithCancel(context.Background())
+
+	shuttingDown atomic.Bool
+	inflight     atomic.Int64
+
+	inflightSem chan struct{} // backpressure: max concurrent HTTP handlers
+	semWait     time.Duration // how long a request may wait for a slot
+
+	dbBreaker  *CircuitBreaker
+	jobQueue   *JobQueue
+	wsLimiter  *RateLimiter // per-WebSocket-connection message limiter
+	maxWSConns int
+
+	// Per-request "this request hit a 5xx" marker, keyed by *breeze.Context.
+	// Written by fail(), read by protect() to feed the circuit breaker.
+	reqFailed sync.Map
+)
+
+// ============================================================
+// Resilience: env helpers
+// ============================================================
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
+func initResilience() {
+	inflightSem = make(chan struct{}, envInt("MAX_INFLIGHT_REQUESTS", 100))
+	semWait = envDuration("BACKPRESSURE_WAIT", 250*time.Millisecond)
+
+	dbBreaker = NewCircuitBreaker(
+		envInt("BREAKER_THRESHOLD", 5),
+		envDuration("BREAKER_COOLDOWN", 15*time.Second),
+		1,
+	)
+
+	jobQueue = NewJobQueue(
+		envInt("QUEUE_WORKERS", 8),
+		envInt("QUEUE_SIZE", 1024),
+		envDuration("QUEUE_JOB_TIMEOUT", 15*time.Second),
+	)
+
+	wsLimiter = NewRateLimiter(5, 10) // 5 msgs/sec sustained, bursts of 10
+	maxWSConns = envInt("MAX_WS_CONNECTIONS", 5000)
+}
+
+// ============================================================
+// Resilience: Rate Limiter (token bucket, per key)
+// ============================================================
+
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
+
+type RateLimiter struct {
+	mu      sync.Mutex
+	rate    float64 // tokens added per second
+	burst   float64
+	buckets map[string]*bucket
+}
+
+func NewRateLimiter(ratePerSec float64, burst int) *RateLimiter {
+	rl := &RateLimiter{
+		rate:    ratePerSec,
+		burst:   float64(burst),
+		buckets: make(map[string]*bucket),
+	}
+	go rl.cleanupLoop()
+	return rl
+}
+
+func (rl *RateLimiter) Allow(key string) bool {
+	now := time.Now()
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	b, ok := rl.buckets[key]
+	if !ok {
+		rl.buckets[key] = &bucket{tokens: rl.burst - 1, last: now}
+		return true
+	}
+
+	b.tokens += now.Sub(b.last).Seconds() * rl.rate
+	if b.tokens > rl.burst {
+		b.tokens = rl.burst
+	}
+	b.last = now
+
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+func (rl *RateLimiter) Remove(key string) {
+	rl.mu.Lock()
+	delete(rl.buckets, key)
+	rl.mu.Unlock()
+}
+
+// cleanupLoop evicts idle buckets so the map cannot grow without bound.
+func (rl *RateLimiter) cleanupLoop() {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-bgCtx.Done():
+			return
+		case <-t.C:
+			cutoff := time.Now().Add(-5 * time.Minute)
+			rl.mu.Lock()
+			for k, b := range rl.buckets {
+				if b.last.Before(cutoff) {
+					delete(rl.buckets, k)
+				}
+			}
+			rl.mu.Unlock()
+		}
+	}
+}
+
+// globalKey: one shared bucket per limiter. Works as a coarse load-shedding
+// valve. Replace with a per-IP key once you know how Breeze exposes the
+// remote address / X-Forwarded-For header.
+func globalKey(*breeze.Context) string { return "global" }
+
+// jsonFieldKey limits per account (e.g. the login "email"), which is what
+// stops credential-guessing without needing the client IP.
+func jsonFieldKey(field string) func(*breeze.Context) string {
+	return func(ctx *breeze.Context) string {
+		var m map[string]interface{}
+		if json.Unmarshal(ctx.Req.Body, &m) == nil {
+			if s, ok := m[field].(string); ok {
+				if s = strings.ToLower(strings.TrimSpace(s)); s != "" {
+					return s
+				}
+			}
+		}
+		return "unknown"
+	}
+}
+
+// ============================================================
+// Resilience: Circuit Breaker
+// ============================================================
+
+type breakerState int
+
+const (
+	breakerClosed breakerState = iota
+	breakerOpen
+	breakerHalfOpen
+)
+
+type CircuitBreaker struct {
+	mu        sync.Mutex
+	state     breakerState
+	failures  int
+	threshold int
+	cooldown  time.Duration
+	openedAt  time.Time
+	probes    int // in-flight half-open probes
+	maxProbes int
+}
+
+func NewCircuitBreaker(threshold int, cooldown time.Duration, maxProbes int) *CircuitBreaker {
+	return &CircuitBreaker{threshold: threshold, cooldown: cooldown, maxProbes: maxProbes}
+}
+
+// Allow reports whether a call may proceed. Every true MUST be followed by
+// exactly one Success() or Failure().
+func (cb *CircuitBreaker) Allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch cb.state {
+	case breakerClosed:
+		return true
+	case breakerOpen:
+		if time.Since(cb.openedAt) < cb.cooldown {
+			return false
+		}
+		cb.state = breakerHalfOpen
+		cb.probes = 1
+		log.Println("circuit breaker: half-open, probing database")
+		return true
+	default: // half-open
+		if cb.probes < cb.maxProbes {
+			cb.probes++
+			return true
+		}
+		return false
+	}
+}
+
+func (cb *CircuitBreaker) Success() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.state == breakerHalfOpen {
+		log.Println("circuit breaker: closed (database recovered)")
+	}
+	cb.state = breakerClosed
+	cb.failures = 0
+	cb.probes = 0
+}
+
+func (cb *CircuitBreaker) Failure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch cb.state {
+	case breakerHalfOpen:
+		cb.trip()
+	case breakerClosed:
+		cb.failures++
+		if cb.failures >= cb.threshold {
+			cb.trip()
+		}
+	}
+}
+
+func (cb *CircuitBreaker) trip() { // caller holds the lock
+	cb.state = breakerOpen
+	cb.openedAt = time.Now()
+	cb.probes = 0
+	cb.failures = 0
+	log.Printf("circuit breaker: OPEN for %s", cb.cooldown)
+}
+
+func (cb *CircuitBreaker) State() string {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	switch cb.state {
+	case breakerOpen:
+		return "open"
+	case breakerHalfOpen:
+		return "half-open"
+	}
+	return "closed"
+}
+
+// ============================================================
+// Resilience: Job Queue (bounded, worker pool)
+// ============================================================
+
+var (
+	ErrQueueFull   = errors.New("job queue is full")
+	ErrQueueClosed = errors.New("job queue is closed")
+)
+
+type Job func(ctx context.Context)
+
+type JobQueue struct {
+	jobs    chan Job
+	wg      sync.WaitGroup
+	mu      sync.RWMutex // guards closed + the close(jobs) call
+	closed  bool
+	timeout time.Duration
+}
+
+func NewJobQueue(workers, size int, jobTimeout time.Duration) *JobQueue {
+	q := &JobQueue{jobs: make(chan Job, size), timeout: jobTimeout}
+	for i := 0; i < workers; i++ {
+		q.wg.Add(1)
+		go q.worker()
+	}
+	return q
+}
+
+func (q *JobQueue) worker() {
+	defer q.wg.Done()
+	for job := range q.jobs {
+		q.run(job)
+	}
+}
+
+func (q *JobQueue) run(job Job) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("job panic recovered: %v", r)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), q.timeout)
+	defer cancel()
+	job(ctx)
+}
+
+// Submit never blocks: a full queue is reported immediately so the caller can
+// push back on its client (that is the backpressure).
+func (q *JobQueue) Submit(j Job) error {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	if q.closed {
+		return ErrQueueClosed
+	}
+	select {
+	case q.jobs <- j:
+		return nil
+	default:
+		return ErrQueueFull
+	}
+}
+
+// Shutdown stops intake, then waits for queued jobs to finish or ctx to expire.
+func (q *JobQueue) Shutdown(ctx context.Context) {
+	q.mu.Lock()
+	if !q.closed {
+		q.closed = true
+		close(q.jobs)
+	}
+	q.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() { q.wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+		log.Println("shutdown: job queue drained")
+	case <-ctx.Done():
+		log.Println("shutdown: job queue drain timed out")
+	}
+}
+
+// runOrQueue defers non-critical work to the queue; if the queue is full or
+// closed it runs inline so the work is never silently dropped.
+func runOrQueue(fn func()) {
+	if err := jobQueue.Submit(func(context.Context) { fn() }); err != nil {
+		fn()
+	}
+}
+
+// ============================================================
+// Resilience: protect() = rate limit + backpressure + circuit breaker
+// ============================================================
+
+func reject(ctx *breeze.Context, status int, msg string, retryAfterSec int) {
+	ctx.Status(status)
+	ctx.JSON(map[string]interface{}{
+		"error":       msg,
+		"retry_after": retryAfterSec,
+	})
+}
+
+// markFailed is called by fail() for every 5xx.
+func markFailed(ctx *breeze.Context) { reqFailed.Store(ctx, true) }
+
+func protect(h func(*breeze.Context), rl *RateLimiter, key func(*breeze.Context) string) func(*breeze.Context) {
+	return func(ctx *breeze.Context) {
+
+		if shuttingDown.Load() {
+			reject(ctx, 503, "Server is shutting down", 5)
+			return
+		}
+
+		if rl != nil && !rl.Allow(key(ctx)) {
+			reject(ctx, 429, "Too many requests", 1)
+			return
+		}
+
+		// Backpressure: wait briefly for a slot, then shed load.
+		select {
+		case inflightSem <- struct{}{}:
+		case <-time.After(semWait):
+			reject(ctx, 503, "Server is busy, try again shortly", 1)
+			return
+		}
+		inflight.Add(1)
+		defer func() {
+			inflight.Add(-1)
+			<-inflightSem
+		}()
+
+		if !dbBreaker.Allow() {
+			reject(ctx, 503, "Service temporarily unavailable", 15)
+			return
+		}
+
+		completed := false
+		defer func() {
+			_, failed := reqFailed.LoadAndDelete(ctx)
+			if failed || !completed { // a panic counts as a failure
+				dbBreaker.Failure()
+			} else {
+				dbBreaker.Success()
+			}
+		}()
+
+		h(ctx)
+		completed = true
+	}
+}
+
+// ============================================================
+// Resilience: Postgres connection parameters (server-side timeouts)
+// ============================================================
+
+// withPGParams adds runtime parameters that lib/pq forwards to Postgres at
+// connect time, without overriding anything already in the URL/DSN.
+func withPGParams(dsn string, params map[string]string) string {
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return dsn
+		}
+		q := u.Query()
+		for k, v := range params {
+			if q.Get(k) == "" {
+				q.Set(k, v)
+			}
+		}
+		u.RawQuery = q.Encode()
+		return u.String()
+	}
+	for k, v := range params {
+		if !strings.Contains(dsn, k+"=") {
+			dsn += fmt.Sprintf(" %s=%s", k, v)
+		}
+	}
+	return dsn
+}
+
+// ============================================================
+// Resilience: Graceful shutdown
+// ============================================================
+
+func gracefulShutdown(timeout time.Duration) {
+	log.Println("shutdown: draining…")
+
+	// 1. Stop taking new work (protect() now answers 503, /health goes 503).
+	shuttingDown.Store(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 2. Wait for in-flight HTTP handlers.
+	t := time.NewTicker(50 * time.Millisecond)
+	defer t.Stop()
+wait:
+	for inflight.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			log.Printf("shutdown: %d requests still running, giving up", inflight.Load())
+			break wait
+		case <-t.C:
+		}
+	}
+
+	// 3. Drain queued jobs (WebSocket messages, async updates).
+	jobQueue.Shutdown(ctx)
+
+	// 4. Stop background goroutines. The DB is closed by main's defer.
+	bgCancel()
+	log.Println("shutdown: complete")
 }
 
 // ============================================================
@@ -79,8 +565,17 @@ func main() {
 	if err := CreateTables(); err != nil {
 		log.Fatal("Database migration failed:", err)
 	}
-
 	log.Println("Database connected successfully")
+
+	initResilience()
+
+	// Rate limiters (rate/sec, burst)
+	apiLimiter := NewRateLimiter(100, 200) // coarse global valve
+	loginLimiter := NewRateLimiter(0.2, 5) // per account: 5 tries, then 1 per 5s
+
+	api := func(h func(*breeze.Context)) func(*breeze.Context) {
+		return protect(h, apiLimiter, globalKey)
+	}
 
 	router := breeze.NewRouter()
 
@@ -94,55 +589,67 @@ func main() {
 		})
 	})
 
+	// Readiness: 503 while draining so a load balancer stops sending traffic.
 	router.Handle(breeze.GET, "/health", func(ctx *breeze.Context) {
+		st := db.Stats()
+		status := "healthy"
+		if shuttingDown.Load() {
+			ctx.Status(503)
+			status = "shutting_down"
+		}
 		ctx.JSON(map[string]interface{}{
-			"status": "healthy",
+			"status":        status,
+			"db_breaker":    dbBreaker.State(),
+			"db_open_conns": st.OpenConnections,
+			"db_in_use":     st.InUse,
+			"db_wait_count": st.WaitCount,
+			"inflight":      inflight.Load(),
 		})
 	})
 
 	// ---------- Doctors ----------
-	router.HandleBlocking(breeze.POST, "/doctors", CreateDoctor)
-	router.HandleBlocking(breeze.GET, "/doctors", GetDoctors)
-	router.HandleBlocking(breeze.GET, "/doctors/:id", GetDoctor)
-	router.HandleBlocking(breeze.PUT, "/doctors/:id", UpdateDoctor)
-	router.HandleBlocking(breeze.DELETE, "/doctors/:id", DeleteDoctor)
+	router.HandleBlocking(breeze.POST, "/doctors", api(CreateDoctor))
+	router.HandleBlocking(breeze.GET, "/doctors", api(GetDoctors))
+	router.HandleBlocking(breeze.GET, "/doctors/:id", api(GetDoctor))
+	router.HandleBlocking(breeze.PUT, "/doctors/:id", api(UpdateDoctor))
+	router.HandleBlocking(breeze.DELETE, "/doctors/:id", api(DeleteDoctor))
 
 	// Static segment, so it wins over "/doctors/:id" for POST lookups.
-	router.HandleBlocking(breeze.POST, "/doctors/login", LoginDoctor)
+	router.HandleBlocking(breeze.POST, "/doctors/login", protect(LoginDoctor, loginLimiter, jsonFieldKey("email")))
 
-	router.HandleBlocking(breeze.PATCH, "/doctors/:id/status", UpdateDoctorStatus)
+	router.HandleBlocking(breeze.PATCH, "/doctors/:id/status", api(UpdateDoctorStatus))
 
 	// The SvelteKit dashboard proxies this as POST /api/doctors/:id/chat-image.
-	router.HandleBlocking(breeze.POST, "/doctors/:id/chat-image", SaveDoctorChatImage)
+	router.HandleBlocking(breeze.POST, "/doctors/:id/chat-image", api(SaveDoctorChatImage))
 
 	// ---------- Patients ----------
-	router.HandleBlocking(breeze.POST, "/patients", CreatePatient)
+	router.HandleBlocking(breeze.POST, "/patients", api(CreatePatient))
 
 	// Static segment wins over "/patients/:id" for POST lookups.
-	router.HandleBlocking(breeze.POST, "/patients/login", LoginPatient)
+	router.HandleBlocking(breeze.POST, "/patients/login", protect(LoginPatient, loginLimiter, jsonFieldKey("username")))
 
-	router.HandleBlocking(breeze.GET, "/patients", GetPatients)
-	router.HandleBlocking(breeze.GET, "/patients/:id", GetPatient)
-	router.HandleBlocking(breeze.PUT, "/patients/:id", UpdatePatient)
-	router.HandleBlocking(breeze.DELETE, "/patients/:id", DeletePatient)
+	router.HandleBlocking(breeze.GET, "/patients", api(GetPatients))
+	router.HandleBlocking(breeze.GET, "/patients/:id", api(GetPatient))
+	router.HandleBlocking(breeze.PUT, "/patients/:id", api(UpdatePatient))
+	router.HandleBlocking(breeze.DELETE, "/patients/:id", api(DeletePatient))
 
 	// The SvelteKit dashboard proxies this as POST /api/patients/:id/chat-image.
-	router.HandleBlocking(breeze.POST, "/patients/:id/chat-image", SavePatientChatImage)
+	router.HandleBlocking(breeze.POST, "/patients/:id/chat-image", api(SavePatientChatImage))
 
 	// ---------- Work Places ----------
-	router.HandleBlocking(breeze.POST, "/work-places", CreateWorkPlace)
-	router.HandleBlocking(breeze.GET, "/work-places", GetWorkPlaces)
-	router.HandleBlocking(breeze.GET, "/work-places/:id", GetWorkPlace)
-	router.HandleBlocking(breeze.PUT, "/work-places/:id", UpdateWorkPlace)
-	router.HandleBlocking(breeze.DELETE, "/work-places/:id", DeleteWorkPlace)
-	router.HandleBlocking(breeze.POST, "/work-places/:id/schedules", SetWorkSchedules)
+	router.HandleBlocking(breeze.POST, "/work-places", api(CreateWorkPlace))
+	router.HandleBlocking(breeze.GET, "/work-places", api(GetWorkPlaces))
+	router.HandleBlocking(breeze.GET, "/work-places/:id", api(GetWorkPlace))
+	router.HandleBlocking(breeze.PUT, "/work-places/:id", api(UpdateWorkPlace))
+	router.HandleBlocking(breeze.DELETE, "/work-places/:id", api(DeleteWorkPlace))
+	router.HandleBlocking(breeze.POST, "/work-places/:id/schedules", api(SetWorkSchedules))
 
 	// ---------- Chat ----------
-	router.HandleBlocking(breeze.POST, "/conversations", CreateConversation)
-	router.HandleBlocking(breeze.GET, "/conversations", GetConversations)
-	router.HandleBlocking(breeze.GET, "/conversations/:id/messages", GetMessages)
-	router.HandleBlocking(breeze.POST, "/conversations/:id/messages", SendMessage)
-	router.HandleBlocking(breeze.POST, "/conversations/:id/messages/image", SendImageMessage)
+	router.HandleBlocking(breeze.POST, "/conversations", api(CreateConversation))
+	router.HandleBlocking(breeze.GET, "/conversations", api(GetConversations))
+	router.HandleBlocking(breeze.GET, "/conversations/:id/messages", api(GetMessages))
+	router.HandleBlocking(breeze.POST, "/conversations/:id/messages", api(SendMessage))
+	router.HandleBlocking(breeze.POST, "/conversations/:id/messages/image", api(SendImageMessage))
 
 	// Clients connect to ws://HOST:PORT/ws/chat and first send a "subscribe" message.
 	chatHandler := &breeze.WSHandlerFunc{
@@ -162,10 +669,22 @@ func main() {
 		}
 	}
 
-	log.Printf("Server running on port %d", port)
+	// Run the server in the background; wait for a signal or a fatal error.
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	if err := app.Run(port, true); err != nil {
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("Server running on port %d", port)
+		serverErr <- app.Run(port, true)
+	}()
+
+	select {
+	case err := <-serverErr:
 		log.Fatal(err)
+	case <-sigCtx.Done():
+		stop() // a second Ctrl+C now kills the process immediately
+		gracefulShutdown(envDuration("SHUTDOWN_TIMEOUT", 25*time.Second))
 	}
 }
 
@@ -180,13 +699,30 @@ func InitDB() error {
 		return fmt.Errorf("DATABASE_URL is not set")
 	}
 
+	// Server-side timeouts apply to EVERY query and transaction, so no handler
+	// can hang forever on a slow query, a lock, or an abandoned transaction.
+	databaseURL = withPGParams(databaseURL, map[string]string{
+		"connect_timeout":                     "10",    // seconds
+		"statement_timeout":                   "10000", // ms
+		"lock_timeout":                        "5000",  // ms
+		"idle_in_transaction_session_timeout": "15000", // ms
+	})
+
 	var err error
 	db, err = sql.Open("postgres", databaseURL)
 	if err != nil {
 		return err
 	}
 
-	return db.Ping()
+	// Connection pool
+	db.SetMaxOpenConns(envInt("DB_MAX_OPEN_CONNS", 25))
+	db.SetMaxIdleConns(envInt("DB_MAX_IDLE_CONNS", 10))
+	db.SetConnMaxLifetime(envDuration("DB_CONN_MAX_LIFETIME", 30*time.Minute))
+	db.SetConnMaxIdleTime(envDuration("DB_CONN_MAX_IDLE_TIME", 5*time.Minute))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return db.PingContext(ctx)
 }
 
 // ============================================================
@@ -1806,7 +2342,8 @@ func SendImageMessage(ctx *breeze.Context) {
 // The doctor uploads a picture (multipart field "image", 5 MB max, JPEG/PNG/
 // WebP). It is persisted as:
 //  1. the doctor's profile_image column, and
-//  2. first_message on all of the doctor's existing conversations.
+//  2. first_message on all of the doctor's existing conversations
+//     (done in the background job queue).
 //
 // If the doctor has no conversation yet, first_message is written the next
 // time CreateConversation runs.
@@ -1851,13 +2388,17 @@ func SaveDoctorChatImage(ctx *breeze.Context) {
 		fail(ctx, 500, "Failed to encode first message", err)
 		return
 	}
-	if _, err := db.Exec(`
-		UPDATE conversations
-		SET first_message = $1::jsonb, updated_at = NOW()
-		WHERE doctor_id = $2
-	`, fm, doctorID); err != nil {
-		log.Println("failed to update first_message for doctor:", err)
-	}
+
+	// The image is already saved, so this fan-out doesn't block the response.
+	runOrQueue(func() {
+		if _, err := db.Exec(`
+			UPDATE conversations
+			SET first_message = $1::jsonb, updated_at = NOW()
+			WHERE doctor_id = $2
+		`, fm, doctorID); err != nil {
+			log.Println("failed to update first_message for doctor:", err)
+		}
+	})
 
 	ctx.JSON(map[string]interface{}{
 		"message": "Doctor image saved",
@@ -1907,13 +2448,16 @@ func SavePatientChatImage(ctx *breeze.Context) {
 		fail(ctx, 500, "Failed to encode first message", err)
 		return
 	}
-	if _, err := db.Exec(`
-		UPDATE conversations
-		SET first_message = $1::jsonb, updated_at = NOW()
-		WHERE patient_id = $2
-	`, fm, patientID); err != nil {
-		log.Println("failed to update first_message for patient:", err)
-	}
+
+	runOrQueue(func() {
+		if _, err := db.Exec(`
+			UPDATE conversations
+			SET first_message = $1::jsonb, updated_at = NOW()
+			WHERE patient_id = $2
+		`, fm, patientID); err != nil {
+			log.Println("failed to update first_message for patient:", err)
+		}
+	})
 
 	ctx.JSON(map[string]interface{}{
 		"message": "Patient image saved",
@@ -1946,8 +2490,15 @@ func broadcastChatMessage(m Message) {
 	}
 }
 
+func connKey(conn *breeze.WSConn) string { return fmt.Sprintf("%p", conn) }
+
 func chatWSOnConnect(conn *breeze.WSConn) {
 	chatWS.Lock()
+	if len(chatWS.clients) >= maxWSConns {
+		chatWS.Unlock()
+		_ = conn.SendText(`{"type":"error","error":"Server is at capacity, try again later"}`)
+		return // not registered, so every message from it is ignored
+	}
 	chatWS.clients[conn] = ""
 	chatWS.Unlock()
 	_ = conn.SendText(`{"type":"connected","message":"Send a subscribe event to join a conversation"}`)
@@ -1957,11 +2508,19 @@ func chatWSOnClose(conn *breeze.WSConn, code uint16, reason string) {
 	chatWS.Lock()
 	delete(chatWS.clients, conn)
 	chatWS.Unlock()
+	wsLimiter.Remove(connKey(conn))
 }
 
 func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 
 	if opcode != 1 { // text frames only for the JSON chat protocol
+		return
+	}
+
+	chatWS.RLock()
+	_, registered := chatWS.clients[conn]
+	chatWS.RUnlock()
+	if !registered {
 		return
 	}
 
@@ -1983,11 +2542,17 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 			_ = conn.SendText(`{"type":"error","error":"conversation_id, sender_type and sender_id are required"}`)
 			return
 		}
+		if !dbBreaker.Allow() {
+			_ = conn.SendText(`{"type":"error","error":"Service temporarily unavailable"}`)
+			return
+		}
 		ok, err := conversationExistsForSender(req.ConversationID, req.SenderType, req.SenderID)
 		if err != nil {
+			dbBreaker.Failure()
 			_ = conn.SendText(`{"type":"error","error":"Failed to validate conversation"}`)
 			return
 		}
+		dbBreaker.Success()
 		if !ok {
 			_ = conn.SendText(`{"type":"error","error":"Sender is not a member of this conversation"}`)
 			return
@@ -1998,6 +2563,15 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 		_ = conn.SendText(`{"type":"subscribed"}`)
 
 	case "message":
+		if shuttingDown.Load() {
+			_ = conn.SendText(`{"type":"error","error":"Server is shutting down"}`)
+			return
+		}
+		if !wsLimiter.Allow(connKey(conn)) {
+			_ = conn.SendText(`{"type":"error","error":"Rate limit exceeded, slow down"}`)
+			return
+		}
+
 		chatWS.RLock()
 		subscribedConversation := chatWS.clients[conn]
 		chatWS.RUnlock()
@@ -2014,9 +2588,9 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 			_ = conn.SendText(`{"type":"error","error":"message or image is required"}`)
 			return
 		}
-		ok, err := conversationExistsForSender(req.ConversationID, req.SenderType, req.SenderID)
-		if err != nil || !ok {
-			_ = conn.SendText(`{"type":"error","error":"Sender is not a member of this conversation"}`)
+		// base64 inflates by ~4/3; reject oversized images before they hit the DB.
+		if len(req.Image) > MaxImageSize*4/3+1024 {
+			_ = conn.SendText(`{"type":"error","error":"Image too large"}`)
 			return
 		}
 
@@ -2026,13 +2600,36 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 			imgPtr = &v
 		}
 
-		m, err := insertMessage(req.ConversationID, req.SenderType, req.SenderID, req.Message, imgPtr)
-		if err != nil {
-			log.Println("ws insertMessage error:", err)
-			_ = conn.SendText(`{"type":"error","error":"Failed to save message"}`)
-			return
+		// All DB work moves off the socket-reading goroutine into the queue.
+		err := jobQueue.Submit(func(context.Context) {
+			if !dbBreaker.Allow() {
+				_ = conn.SendText(`{"type":"error","error":"Service temporarily unavailable"}`)
+				return
+			}
+			ok, err := conversationExistsForSender(req.ConversationID, req.SenderType, req.SenderID)
+			if err != nil {
+				dbBreaker.Failure()
+				_ = conn.SendText(`{"type":"error","error":"Failed to validate conversation"}`)
+				return
+			}
+			if !ok {
+				dbBreaker.Success()
+				_ = conn.SendText(`{"type":"error","error":"Sender is not a member of this conversation"}`)
+				return
+			}
+			m, err := insertMessage(req.ConversationID, req.SenderType, req.SenderID, req.Message, imgPtr)
+			if err != nil {
+				dbBreaker.Failure()
+				log.Println("ws insertMessage error:", err)
+				_ = conn.SendText(`{"type":"error","error":"Failed to save message"}`)
+				return
+			}
+			dbBreaker.Success()
+			broadcastChatMessage(m)
+		})
+		if err != nil { // queue full or closed: tell the client to back off
+			_ = conn.SendText(`{"type":"error","error":"Server is busy, retry shortly"}`)
 		}
-		broadcastChatMessage(m)
 
 	default:
 		_ = conn.SendText(`{"type":"error","error":"Unknown event type"}`)
@@ -2183,13 +2780,17 @@ func GetWorkPlaces(ctx *breeze.Context) {
 		scanNullableFloat(nfP, &wp.ExamPrice)
 		wp.CreatedAt = createdAt.Format(time.RFC3339)
 		wp.UpdatedAt = updatedAt.Format(time.RFC3339)
-		wp.Schedules = loadSchedules(wp.ID)
 		places = append(places, wp)
 	}
 
 	if err := rows.Err(); err != nil {
 		fail(ctx, 500, "Failed to read work places", err)
 		return
+	}
+	rows.Close() // release the connection BEFORE issuing more queries (avoids pool deadlock)
+
+	for i := range places {
+		places[i].Schedules = loadSchedules(places[i].ID)
 	}
 
 	ctx.JSON(map[string]interface{}{"count": len(places), "work_places": places})
