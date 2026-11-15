@@ -1185,6 +1185,10 @@ func CreateDoctor(ctx *breeze.Context) {
 			fail(ctx, 409, "Phone, email, national_id or medical_syndicate_id already exists", nil)
 			return
 		}
+		if isBadInputError(err) {
+			fail(ctx, 400, "Invalid doctor data (check birth_date, professional_degree, governorate and field lengths)", nil)
+			return
+		}
 		fail(ctx, 500, "Failed to create doctor", err)
 		return
 	}
@@ -1487,6 +1491,25 @@ func UpdateDoctor(ctx *breeze.Context) {
 	professionalDegree := formValue("professional_degree")
 	governorate := formValue("governorate")
 
+	// Same required-field validation as CreateDoctor, so bad client input
+	// returns 400 instead of a 500 that would count against the breaker.
+	required := map[string]string{
+		"full_name":            fullName,
+		"phone":                phone,
+		"national_id":          nationalID,
+		"medical_syndicate_id": medicalSyndicateID,
+		"birth_date":           birthDate,
+		"specialty":            specialty,
+		"professional_degree":  professionalDegree,
+		"governorate":          governorate,
+	}
+	for field, value := range required {
+		if strings.TrimSpace(value) == "" {
+			fail(ctx, 400, field+" is required", nil)
+			return
+		}
+	}
+
 	result, err := db.Exec(`
 		UPDATE doctors
 		SET
@@ -1516,6 +1539,10 @@ func UpdateDoctor(ctx *breeze.Context) {
 	if err != nil {
 		if isUniqueViolation(err) {
 			fail(ctx, 409, "Phone, email, national_id or medical_syndicate_id already exists", nil)
+			return
+		}
+		if isBadInputError(err) {
+			fail(ctx, 400, "Invalid doctor data (check birth_date, professional_degree, governorate and field lengths)", nil)
 			return
 		}
 		fail(ctx, 500, "Failed to update doctor", err)
@@ -1727,6 +1754,10 @@ func CreatePatient(ctx *breeze.Context) {
 			fail(ctx, 409, "Username or phone already exists", nil)
 			return
 		}
+		if isBadInputError(err) {
+			fail(ctx, 400, "Invalid patient data (username or phone is too long)", nil)
+			return
+		}
 		fail(ctx, 500, "Failed to create patient", err)
 		return
 	}
@@ -1858,6 +1889,10 @@ func UpdatePatient(ctx *breeze.Context) {
 	if err != nil {
 		if isUniqueViolation(err) {
 			fail(ctx, 409, "Username or phone already exists", nil)
+			return
+		}
+		if isBadInputError(err) {
+			fail(ctx, 400, "Invalid patient data (username or phone is too long)", nil)
 			return
 		}
 		fail(ctx, 500, "Failed to update patient", err)
@@ -2511,6 +2546,45 @@ func chatWSOnClose(conn *breeze.WSConn, code uint16, reason string) {
 	wsLimiter.Remove(connKey(conn))
 }
 
+// normalizeImageDataURL validates a base64 image data URL received over the
+// WebSocket. Like the REST upload path, it decodes the bytes and detects the
+// real type instead of trusting the client's declared MIME type.
+// It returns the data URL rebuilt with the detected type.
+func normalizeImageDataURL(s string) (string, error) {
+
+	s = strings.TrimSpace(s)
+	const marker = ";base64,"
+
+	if !strings.HasPrefix(s, "data:") {
+		return "", errors.New("image must be a base64 data URL")
+	}
+	idx := strings.Index(s, marker)
+	if idx < 0 {
+		return "", errors.New("image must be a base64 data URL")
+	}
+
+	b64 := s[idx+len(marker):]
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return "", errors.New("image is not valid base64")
+	}
+	if len(raw) == 0 {
+		return "", errors.New("image is empty")
+	}
+	if len(raw) > MaxImageSize {
+		return "", errors.New("image too large")
+	}
+
+	contentType := httpDetectContentType(raw)
+	switch contentType {
+	case "image/jpeg", "image/png", "image/webp":
+	default:
+		return "", fmt.Errorf("invalid image type: %s", contentType)
+	}
+
+	return "data:" + contentType + ";base64," + b64, nil
+}
+
 func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 
 	if opcode != 1 { // text frames only for the JSON chat protocol
@@ -2584,24 +2658,33 @@ func chatWSOnMessage(conn *breeze.WSConn, opcode byte, payload []byte) {
 			_ = conn.SendText(`{"type":"error","error":"sender_type and sender_id are required"}`)
 			return
 		}
-		if strings.TrimSpace(req.Message) == "" && strings.TrimSpace(req.Image) == "" {
+
+		rawImage := strings.TrimSpace(req.Image)
+		if strings.TrimSpace(req.Message) == "" && rawImage == "" {
 			_ = conn.SendText(`{"type":"error","error":"message or image is required"}`)
 			return
 		}
-		// base64 inflates by ~4/3; reject oversized images before they hit the DB.
-		if len(req.Image) > MaxImageSize*4/3+1024 {
+		// base64 inflates by ~4/3; reject oversized images before doing any work.
+		if len(rawImage) > MaxImageSize*4/3+1024 {
 			_ = conn.SendText(`{"type":"error","error":"Image too large"}`)
 			return
 		}
 
-		var imgPtr *string
-		if strings.TrimSpace(req.Image) != "" {
-			v := req.Image
-			imgPtr = &v
-		}
-
-		// All DB work moves off the socket-reading goroutine into the queue.
+		// All DB work (and image decoding) moves off the socket-reading
+		// goroutine into the queue.
 		err := jobQueue.Submit(func(context.Context) {
+
+			var imgPtr *string
+			if rawImage != "" {
+				normalized, err := normalizeImageDataURL(rawImage)
+				if err != nil {
+					b, _ := json.Marshal(ChatWSEvent{Type: "error", Error: err.Error()})
+					_ = conn.SendText(string(b))
+					return
+				}
+				imgPtr = &normalized
+			}
+
 			if !dbBreaker.Allow() {
 				_ = conn.SendText(`{"type":"error","error":"Service temporarily unavailable"}`)
 				return
@@ -2708,6 +2791,10 @@ func CreateWorkPlace(ctx *breeze.Context) {
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
+		if isBadInputError(err) {
+			fail(ctx, 400, "Invalid work place data (check place_type, exam_price and field lengths)", nil)
+			return
+		}
 		fail(ctx, 500, "Failed to create work place", err)
 		return
 	}
@@ -2881,6 +2968,10 @@ func UpdateWorkPlace(ctx *breeze.Context) {
 		WHERE id = $6
 	`, payload.PlaceType, payload.Name, payload.Address, payload.Phone, payload.ExamPrice, id)
 	if err != nil {
+		if isBadInputError(err) {
+			fail(ctx, 400, "Invalid work place data (check place_type, exam_price and field lengths)", nil)
+			return
+		}
 		fail(ctx, 500, "Failed to update work place", err)
 		return
 	}
@@ -3137,12 +3228,33 @@ func httpDetectContentType(data []byte) string {
 }
 
 // ============================================================
-// Database Error Helper
+// Database Error Helpers
 // ============================================================
+
+// pgCode returns the Postgres SQLSTATE of err, or "" if it is not a pq error.
+func pgCode(err error) string {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return string(pqErr.Code)
+	}
+	return ""
+}
 
 // isUniqueViolation reports whether err is a Postgres 23505 (unique_violation)
 // so create/update paths can return 409 instead of 500.
 func isUniqueViolation(err error) bool {
-	var pqErr *pq.Error
-	return errors.As(err, &pqErr) && pqErr.Code == "23505"
+	return pgCode(err) == "23505"
+}
+
+// isBadInputError reports whether err was caused by client-supplied data
+// rather than a server fault, so the handler can answer 400 instead of 500:
+//   - 23514 check_violation (e.g. invalid governorate / professional_degree)
+//   - 23502 not_null_violation
+//   - class 22 data exceptions (bad date format, value too long, ...)
+func isBadInputError(err error) bool {
+	code := pgCode(err)
+	if code == "" {
+		return false
+	}
+	return code == "23514" || code == "23502" || strings.HasPrefix(code, "22")
 }
