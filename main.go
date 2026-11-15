@@ -2359,7 +2359,7 @@ func SendImageMessage(ctx *breeze.Context) {
 
 	m, err := insertMessage(conversationID, senderType, senderID, message, imageData)
 	if err != nil {
-		fail(ctx, 500, "Failed to save image message", err)
+		fail(ctx, 500, "تعذّر حفظ رسالة الصورة", err)
 		return
 	}
 
