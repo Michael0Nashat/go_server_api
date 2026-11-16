@@ -2367,6 +2367,13 @@ func SendImageMessage(ctx *breeze.Context) {
 		return
 	}
 
+	// Ensure the constraint (NULLIF(TRIM(message), '') IS NOT NULL OR image_data IS NOT NULL) is satisfied.
+	// If message is empty/whitespace, image_data must be provided; if message has content, constraint is satisfied.
+	// Default message to a space if empty to avoid constraint violation when image_data is provided.
+	if strings.TrimSpace(message) == "" && imageData == nil {
+		message = " "
+	}
+
 	m, err := insertMessage(conversationID, senderType, senderID, message, imageData)
 	if err != nil {
 		fail(ctx, 500, "تعذّر حفظ رسالة الصورة", err)
