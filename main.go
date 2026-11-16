@@ -2248,11 +2248,21 @@ func insertMessage(conversationID, senderType, senderID, message string, imageDa
 	var msg, image sql.NullString
 	var createdAt time.Time
 
+	// Use NULLIF only if message is not empty after trim; otherwise pass the trimmed message
+	// so the CHECK constraint (NULLIF(TRIM(message), '') IS NOT NULL OR image_data IS NOT NULL)
+	// is satisfied when image_data is provided.
+	var messageForDB string
+	if strings.TrimSpace(message) == "" {
+		messageForDB = message // keep as empty string; constraint will check image_data IS NOT NULL
+	} else {
+		messageForDB = strings.TrimSpace(message)
+	}
+
 	err := db.QueryRow(`
 		INSERT INTO messages (conversation_id, sender_type, sender_id, message, image_data)
-		VALUES ($1, $2, $3, NULLIF($4, ''), $5)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, conversation_id, sender_type, sender_id, message, image_data, created_at
-	`, conversationID, senderType, senderID, strings.TrimSpace(message), imageData).Scan(
+	`, conversationID, senderType, senderID, messageForDB, imageData).Scan(
 		&m.ID, &m.ConversationID, &m.SenderType, &m.SenderID, &msg, &image, &createdAt,
 	)
 	if err != nil {
