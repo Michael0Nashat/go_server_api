@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -2369,13 +2370,15 @@ func SendImageMessage(ctx *breeze.Context) {
 
 	// Ensure the constraint (NULLIF(TRIM(message), '') IS NOT NULL OR image_data IS NOT NULL) is satisfied.
 	// If message is empty/whitespace, image_data must be provided; if message has content, constraint is satisfied.
-	// Default message to a space if empty to avoid constraint violation when image_data is provided.
+	// Default message to a space only when there's no image data to avoid constraint violation.
 	if strings.TrimSpace(message) == "" && imageData == nil {
 		message = " "
 	}
 
 	m, err := insertMessage(conversationID, senderType, senderID, message, imageData)
 	if err != nil {
+		// Log the full error for debugging, but show a user-friendly message
+		log.Printf("Failed to save image message: %v", err)
 		fail(ctx, 500, "تعذّر حفظ رسالة الصورة", err)
 		return
 	}
@@ -3224,6 +3227,18 @@ func readUploadedFile(
 
 	contentType := httpDetectContentType(file.Content)
 
+	// Try to detect content type from file extension as fallback
+	// since http.DetectContentType may not work for all image formats
+	if !isValidContentType(contentType, allowedTypes) && file.Filename != "" {
+		ext := strings.ToLower(filepath.Ext(file.Filename))
+		contentType = guessContentTypeFromExt(ext)
+		if contentType != "" && isValidContentType(contentType, allowedTypes) {
+			// Use the extension-detected content type
+		} else if contentType != "" {
+			contentType = httpDetectContentType(file.Content) // fall back to original
+		}
+	}
+
 	valid := false
 	for _, allowed := range allowedTypes {
 		if contentType == allowed {
@@ -3232,12 +3247,36 @@ func readUploadedFile(
 		}
 	}
 	if !valid {
-		return nil, fmt.Errorf("invalid file type for %s: %s", fieldName, contentType)
+		return nil, fmt.Errorf("invalid file type for %s: detected %s", fieldName, contentType)
 	}
 
 	encoded := base64.StdEncoding.EncodeToString(file.Content)
 	result := "data:" + contentType + ";base64," + encoded
 	return &result, nil
+}
+
+func isValidContentType(contentType string, allowedTypes []string) bool {
+	for _, allowed := range allowedTypes {
+		if contentType == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func guessContentTypeFromExt(ext string) string {
+	switch ext {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	default:
+		return ""
+	}
 }
 
 func httpDetectContentType(data []byte) string {
